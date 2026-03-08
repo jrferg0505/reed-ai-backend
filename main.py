@@ -1,111 +1,79 @@
-import os
-import json
-import requests
-import anthropic
-from datetime import datetime
+import os, json, re, requests, threading
+from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.base import STATE_RUNNING
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from twilio.rest import Client
-import pytz
-import threading
 
 app = Flask(__name__)
 CORS(app)
 
-ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_KEY")
-TWILIO_SID      = os.environ.get("TWILIO_SID")
-TWILIO_TOKEN    = os.environ.get("TWILIO_TOKEN")
-TWILIO_FROM     = os.environ.get("TWILIO_FROM")
-REED_PHONE      = os.environ.get("REED_PHONE")
-BRIEFING_HOUR   = int(os.environ.get("BRIEFING_HOUR", "8"))
-TIMEZONE        = os.environ.get("TIMEZONE", "America/New_York")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
+TWILIO_SID    = os.environ.get("TWILIO_SID")
+TWILIO_TOKEN  = os.environ.get("TWILIO_TOKEN")
+TWILIO_FROM   = os.environ.get("TWILIO_FROM")
+REED_PHONE    = os.environ.get("REED_PHONE")
+BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "8"))
+TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 
-SEEN_JOBS_FILE = "seen_jobs.json"
-
-def load_seen():
+def load_json(path, default):
     try:
-        with open(SEEN_JOBS_FILE) as f:
-            return set(json.load(f))
-    except:
-        return set()
+        with open(path) as f: return json.load(f)
+    except: return default
 
-def save_seen(seen):
-    with open(SEEN_JOBS_FILE, "w") as f:
-        json.dump(list(seen), f)
+def save_json(path, data):
+    with open(path, "w") as f: json.dump(data, f)
 
 def send_whatsapp(body):
     try:
-        client = Client(TWILIO_SID, TWILIO_TOKEN)
-        client.messages.create(
-            body=body,
-            from_="whatsapp:" + TWILIO_FROM,
-            to="whatsapp:" + REED_PHONE
-        )
+        Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
+            body=body, from_="whatsapp:"+TWILIO_FROM, to="whatsapp:"+REED_PHONE)
         print(f"WhatsApp sent: {body[:60]}...")
     except Exception as e:
         print(f"WhatsApp error: {e}")
 
 def ask_claude(prompt, use_search=False, max_tokens=1024):
-    headers = {
-        "x-api-key": ANTHROPIC_KEY,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
-    }
-    body = {
-        "model": "claude-sonnet-4-20250514",
-        "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": prompt}]
-    }
+    headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+    body = {"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}
     if use_search:
         headers["anthropic-beta"] = "web-search-2025-03-05"
         body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
-
     r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
     data = r.json()
-    if data.get("error"):
-        raise Exception(data["error"]["message"])
-
+    if data.get("error"): raise Exception(data["error"]["message"])
     if data.get("stop_reason") == "tool_use" and use_search:
-        body2 = {
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": max_tokens,
+        r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+            "model": "claude-sonnet-4-20250514", "max_tokens": max_tokens,
             "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-            "messages": [
-                {"role": "user", "content": prompt},
-                {"role": "assistant", "content": data["content"]}
-            ]
-        }
-        r2 = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body2)
-        data = r2.json()
-
-    text = ""
-    for block in data.get("content", []):
-        if block.get("type") == "text":
-            text += block["text"]
-    # Track spend
+            "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": data["content"]}]})
+        data = r.json()
+    text = "".join(b["text"] for b in data.get("content", []) if b.get("type") == "text")
     try:
         usage = data.get("usage", {})
-        track_spend(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
-    except:
-        pass
+        spend = load_json("daily_api_spend.json", {"date": "", "input_tokens": 0, "output_tokens": 0, "calls": 0})
+        today = datetime.now().strftime("%Y-%m-%d")
+        if spend.get("date") != today:
+            spend = {"date": today, "input_tokens": 0, "output_tokens": 0, "calls": 0}
+        spend["input_tokens"] += usage.get("input_tokens", 0)
+        spend["output_tokens"] += usage.get("output_tokens", 0)
+        spend["calls"] += 1
+        save_json("daily_api_spend.json", spend)
+    except: pass
     return text.strip()
 
 def morning_briefing():
     print("Running morning briefing...")
     try:
-        prompt = """Give Reed his morning briefing. Search the web for Indianapolis weather today.
-Format exactly like this (use line breaks, keep total under 400 characters):
+        text = ask_claude("""Search for Indianapolis weather today. Give Reed his morning briefing.
+Format (under 400 chars, use line breaks):
 Good Morning Reed 🌅
-☀️ Weather: [Today's Indianapolis weather — temp + conditions in one line]
-💬 [One punchy motivational quote — real, not cheesy]
-🎯 Focus: [One specific action toward his goals today]
-💼 Job Tip: [One quick actionable job search tip for today]
-
-Reed: Indianapolis, hunting for $18+/hr office job, saving for car, learning AI. Be direct, capitalize every word."""
-        text = ask_claude(prompt, use_search=True)
+☀️ Weather: [Indianapolis weather today — temp + conditions]
+💬 [One punchy motivational quote]
+🎯 Focus: [One specific action toward his goals]
+💼 Job Tip: [One quick job search tip]
+Reed: hunting $18+/hr office job Indianapolis, saving for car, learning AI. Capitalize Every Word.""", use_search=True)
         send_whatsapp(text)
         print("Morning briefing sent.")
     except Exception as e:
@@ -114,164 +82,209 @@ Reed: Indianapolis, hunting for $18+/hr office job, saving for car, learning AI.
 def job_scan():
     print("Running job scan...")
     try:
-        seen = load_seen()
-        prompt = """Search Indeed, LinkedIn, ZipRecruiter, and Google Jobs for real currently open office jobs in Indianapolis Indiana. Requirements: no college degree required, pay $18/hour or more (or $37,000+ salary), in-person office work (no remote), Monday-Friday schedule. Look for roles like: office coordinator, admin assistant, customer success rep, inside sales rep, front desk coordinator, scheduling coordinator, operations assistant, receptionist, account manager, office manager, data entry specialist, or any similar professional office role.
-
-Return ONLY a JSON array, no other text:
-[{"title":"Job Title","company":"Company","location":"City, IN","pay":"$X/hr or $Xk/yr","id":"company-title-city-slug"}]
-
-Return up to 5 real current listings only. Skip anything under $18/hr or that requires a degree."""
-        result = ask_claude(prompt, use_search=True)
-        import re
+        seen = set(load_json("seen_jobs.json", []))
+        result = ask_claude("""Search Indeed LinkedIn ZipRecruiter Google Jobs for open office jobs in Indianapolis IN. No degree, $18+/hr, in-person M-F. Roles: office coordinator, admin assistant, customer success, inside sales, front desk, scheduling, operations, receptionist, data entry.
+Return ONLY JSON array:
+[{"title":"","company":"","location":"","pay":"","id":"slug"}]
+Up to 5 real listings.""", use_search=True)
         match = re.search(r'\[.*\]', result, re.DOTALL)
-        if not match:
-            print("No jobs parsed.")
-            return
+        if not match: return
         jobs = json.loads(match.group())
         new_jobs = [j for j in jobs if j.get("id") not in seen]
-        if not new_jobs:
-            print("No new jobs found.")
-            return
+        if not new_jobs: return
         for job in new_jobs[:3]:
-            msg = f"🔍 New Job Found!\n{job['title']} @ {job['company']}\n📍 {job['location']}\n💰 {job.get('pay','Pay Not Listed')}\n\nOpen Reed AI To Save It."
-            send_whatsapp(msg)
+            send_whatsapp(f"🔍 New Job!\n{job['title']} @ {job['company']}\n📍 {job['location']}\n💰 {job.get('pay','?')}\nOpen Reed AI To Save It.")
             seen.add(job.get("id"))
-        save_seen(seen)
-        print(f"Sent {min(len(new_jobs),3)} new job alerts.")
+        save_json("seen_jobs.json", list(seen))
     except Exception as e:
         print(f"Job scan error: {e}")
+
+def evening_news():
+    print("Running evening news...")
+    try:
+        text = ask_claude("""Search for today's top AI and tech news.
+Format (under 400 chars):
+📡 Today In AI & Tech
+1. [Headline + one sentence]
+2. [Headline + one sentence]
+3. [Headline + one sentence]
+Capitalize Every Word.""", use_search=True)
+        send_whatsapp(text)
+        print("Evening news sent.")
+    except Exception as e:
+        print(f"Evening news error: {e}")
+
+def mood_checkin():
+    print("Running mood check-in...")
+    try:
+        day = datetime.now().strftime("%A")
+        text = ask_claude(f"""Send Reed a quick end-of-day check-in. Today is {day}.
+Under 200 chars. Casual, genuine.
+Hey Reed 🌙
+[One sentence asking how his day went]
+Reply back and I'll listen.""")
+        send_whatsapp(text)
+        print("Mood check-in sent.")
+    except Exception as e:
+        print(f"Mood check-in error: {e}")
 
 def weekly_recap():
     print("Running weekly recap...")
     try:
-        prompt = """Write Reed a brief weekly job search motivation text. Keep under 280 characters.
-Reed is: hunting for a 9-5 office job in Indianapolis, saving for a car, learning AI/tech.
-Format:
+        text = ask_claude("""Write Reed a brief weekly job search motivation text. Under 280 chars.
 📊 Weekly Check-In
-[2 sentences: acknowledge the grind, specific encouragement]
-This Week: [One concrete action to take]"""
-        text = ask_claude(prompt)
+[2 sentences: acknowledge grind, specific encouragement]
+This Week: [One concrete action]""")
         send_whatsapp(text)
-        print("Weekly recap sent.")
     except Exception as e:
         print(f"Weekly recap error: {e}")
+
+def weekly_savings():
+    print("Running weekly savings check...")
+    try:
+        data = load_json("savings.json", {"total": 0, "entries": []})
+        total = data.get("total", 0)
+        weeks = len(data.get("entries", []))
+        msg = f"💰 Weekly Savings Check-In\nTotal Saved: ${total:.2f}\n"
+        if weeks > 0: msg += f"Avg/Week: ${total/weeks:.2f}\n"
+        msg += "\nHow Much Did You Save This Week? Reply With The Amount."
+        send_whatsapp(msg)
+    except Exception as e:
+        print(f"Weekly savings error: {e}")
+
+def daily_spend_ask():
+    print("Running daily spend ask...")
+    send_whatsapp("💸 Hey Reed — How Much Did You Spend Today?\nReply With Just A Number (E.g. '34' or '0').")
+
+def weekly_spend_report():
+    print("Running weekly spend report...")
+    try:
+        data = load_json("daily_personal_spend.json", {"entries": []})
+        today = datetime.now().date()
+        week = [e for e in data.get("entries", []) if (today - datetime.strptime(e["date"], "%Y-%m-%d").date()).days <= 7]
+        if not week:
+            send_whatsapp("📊 Weekly Spend: No Data Logged This Week.")
+            return
+        total = sum(e["amount"] for e in week)
+        avg = total / len(week)
+        hi = max(week, key=lambda e: e["amount"])
+        msg = f"📊 Weekly Spend Report\nTotal: ${total:.2f} Over {len(week)} Days\nAvg/Day: ${avg:.2f}\nHighest: ${hi['amount']:.2f} ({hi['date']})\n"
+        msg += "⚠️ High." if total > 300 else ("👀 Moderate." if total > 150 else "✅ Lean.")
+        send_whatsapp(msg)
+    except Exception as e:
+        print(f"Weekly spend report error: {e}")
+
+def daily_spend_report():
+    print("Running daily API spend report...")
+    try:
+        data = load_json("daily_api_spend.json", {"date": "", "input_tokens": 0, "output_tokens": 0, "calls": 0})
+        cost = (data.get("input_tokens", 0) / 1e6 * 3.0) + (data.get("output_tokens", 0) / 1e6 * 15.0)
+        tokens = data.get("input_tokens", 0) + data.get("output_tokens", 0)
+        cost_str = "< $0.01" if cost < 0.01 else f"${cost:.3f}"
+        msg = f"💰 Daily API Report\nCalls: {data.get('calls',0)}\nTokens: {tokens:,}\nCost: {cost_str}\n"
+        msg += ("⚠️ High Spend." if cost > 0.50 else ("✅ Normal." if cost > 0.10 else "✅ Minimal."))
+        send_whatsapp(msg)
+    except Exception as e:
+        print(f"Daily spend report error: {e}")
+
+def keep_alive():
+    try:
+        requests.get("https://reed-ai-backend.onrender.com/ping", timeout=10)
+    except: pass
 
 def run_agent_job_scan():
     try:
         send_whatsapp("🤖 Starting Job Scan Now. I'll Text You What I Find...")
-        prompt = """Search Indeed, LinkedIn, ZipRecruiter, and Google Jobs for real currently open office jobs in Indianapolis Indiana. Requirements: no college degree required, pay $18/hour or more (or $37,000+ salary), in-person office work only (no remote), Monday-Friday schedule. Look for: office coordinator, admin assistant, customer success rep, inside sales rep, front desk coordinator, scheduling coordinator, operations assistant, receptionist, account manager, data entry specialist, or similar professional office roles.
-
-Return ONLY a JSON array, no other text:
-[{"title":"Job Title","company":"Company","location":"City, IN","pay":"$X/hr or $Xk/yr","applyUrl":"direct job listing URL or empty string","id":"company-title-city-slug"}]
-
-Return up to 5 real current listings. Skip anything under $18/hr or that requires a degree."""
-        result = ask_claude(prompt, use_search=True, max_tokens=2048)
-        import re
+        result = ask_claude("""Search Indeed LinkedIn ZipRecruiter Google Jobs for open office jobs Indianapolis IN. No degree, $18+/hr, in-person M-F.
+Return ONLY JSON:
+[{"title":"","company":"","location":"","pay":"","applyUrl":"","id":""}]
+Up to 5 real listings.""", use_search=True, max_tokens=2048)
         match = re.search(r'\[.*\]', result, re.DOTALL)
         if not match:
-            send_whatsapp("❌ Couldn't Find Jobs Right Now. Try Again In A Few Minutes.")
+            send_whatsapp("❌ Couldn't Find Jobs Right Now. Try Again Later.")
             return
         jobs = json.loads(match.group())
         if not jobs:
-            send_whatsapp("😕 No Jobs Found Right Now. I'll Keep Checking Every 6 Hours.")
+            send_whatsapp("😕 No Jobs Found Right Now. Checking Every 6 Hours.")
             return
-        send_whatsapp(f"✅ Found {len(jobs)} Jobs For You:")
+        send_whatsapp(f"✅ Found {len(jobs)} Jobs:")
         for job in jobs[:5]:
-            msg = f"💼 {job['title']}\n🏢 {job['company']}\n📍 {job['location']}\n💰 {job.get('pay','Not Listed')}"
-            if job.get('applyUrl'):
-                msg += f"\n🔗 {job['applyUrl']}"
+            msg = f"💼 {job['title']}\n🏢 {job['company']}\n📍 {job['location']}\n💰 {job.get('pay','?')}"
+            if job.get('applyUrl'): msg += f"\n🔗 {job['applyUrl']}"
             send_whatsapp(msg)
     except Exception as e:
-        send_whatsapp(f"❌ Job Scan Error: {str(e)[:100]}")
-        print(f"Agent job scan error: {e}")
-
-def run_agent_briefing():
-    try:
-        morning_briefing()
-    except Exception as e:
-        send_whatsapp(f"❌ Briefing Error: {str(e)[:100]}")
+        send_whatsapp(f"❌ Error: {str(e)[:100]}")
 
 def run_agent_task(task_type, custom_prompt=None):
     try:
-        if task_type == "job_scan":
-            run_agent_job_scan()
-        elif task_type == "briefing":
-            run_agent_briefing()
+        if task_type == "job_scan": run_agent_job_scan()
+        elif task_type == "briefing": morning_briefing()
+        elif task_type == "news": evening_news()
+        elif task_type == "checkin": mood_checkin()
         elif task_type == "custom" and custom_prompt:
             send_whatsapp("🤖 Working On It...")
-            result = ask_claude(
-                f"""You are Reed's personal AI assistant. Reed is in Indianapolis, works at a donut shop, job hunting for office work, saving for a car, learning AI. Be direct, no fluff, capitalize every word.
-Task: {custom_prompt}
-Keep response under 500 characters.""",
-                use_search=True
-            )
+            result = ask_claude(f"You are Reed's AI. Reed: Indianapolis, donut shop, hunting $18+/hr office job, saving for car, learning AI. Direct, capitalize every word, under 500 chars.\nTask: {custom_prompt}", use_search=True)
             send_whatsapp(f"✅ Done:\n{result}")
     except Exception as e:
         send_whatsapp(f"❌ Error: {str(e)[:100]}")
 
+# ── SCHEDULER ──
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
-scheduler.add_job(morning_briefing, CronTrigger(hour=BRIEFING_HOUR, minute=0, timezone=TIMEZONE), id="morning_briefing", replace_existing=True)
-scheduler.add_job(job_scan, CronTrigger(hour="*/6", minute=30, timezone=TIMEZONE), id="job_scan", replace_existing=True)
-scheduler.add_job(weekly_recap, CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=TIMEZONE), id="weekly_recap", replace_existing=True)
-scheduler.add_job(daily_spend_report, CronTrigger(hour=21, minute=0, timezone=TIMEZONE), id="spend_report", replace_existing=True)
-scheduler.add_job(evening_news, CronTrigger(hour=19, minute=0, timezone=TIMEZONE), id="evening_news", replace_existing=True)
-scheduler.add_job(mood_checkin, CronTrigger(hour=21, minute=30, timezone=TIMEZONE), id="mood_checkin", replace_existing=True)
-scheduler.add_job(weekly_savings, CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=TIMEZONE), id="weekly_savings", replace_existing=True)
-scheduler.add_job(daily_spend_ask, CronTrigger(hour=22, minute=0, timezone=TIMEZONE), id="daily_spend_ask", replace_existing=True)
-scheduler.add_job(weekly_spend_report, CronTrigger(day_of_week="tue", hour=16, minute=0, timezone=TIMEZONE), id="weekly_spend_report", replace_existing=True)
-
-# Keep-alive — ping self every 5 minutes so Render never spins down
-def keep_alive():
-    try:
-        requests.get("https://reed-ai-backend.onrender.com/ping", timeout=10)
-        print("Keep-alive ping sent.")
-    except Exception as e:
-        print(f"Keep-alive error: {e}")
-
-scheduler.add_job(keep_alive, "interval", minutes=5, id="keep_alive", replace_existing=True)
-scheduler.add_job(evening_news, CronTrigger(hour=19, minute=0, timezone=TIMEZONE), id="evening_news", replace_existing=True)
-scheduler.add_job(mood_checkin, CronTrigger(hour=21, minute=30, timezone=TIMEZONE), id="mood_checkin", replace_existing=True)
-scheduler.add_job(weekly_savings, CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=TIMEZONE), id="weekly_savings", replace_existing=True)
-scheduler.add_job(daily_spend_ask, CronTrigger(hour=22, minute=0, timezone=TIMEZONE), id="daily_spend_ask", replace_existing=True)
-scheduler.add_job(weekly_spend_report, CronTrigger(day_of_week="tue", hour=16, minute=0, timezone=TIMEZONE), id="weekly_spend_report", replace_existing=True)
+scheduler.add_job(morning_briefing,    CronTrigger(hour=BRIEFING_HOUR, minute=0, timezone=TIMEZONE),        id="morning_briefing",    replace_existing=True)
+scheduler.add_job(job_scan,            CronTrigger(hour="*/6", minute=30, timezone=TIMEZONE),               id="job_scan",            replace_existing=True)
+scheduler.add_job(evening_news,        CronTrigger(hour=19, minute=0, timezone=TIMEZONE),                   id="evening_news",        replace_existing=True)
+scheduler.add_job(mood_checkin,        CronTrigger(hour=21, minute=30, timezone=TIMEZONE),                  id="mood_checkin",        replace_existing=True)
+scheduler.add_job(weekly_recap,        CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=TIMEZONE),id="weekly_recap",        replace_existing=True)
+scheduler.add_job(weekly_savings,      CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=TIMEZONE),id="weekly_savings",      replace_existing=True)
+scheduler.add_job(daily_spend_ask,     CronTrigger(hour=22, minute=0, timezone=TIMEZONE),                   id="daily_spend_ask",     replace_existing=True)
+scheduler.add_job(weekly_spend_report, CronTrigger(day_of_week="tue", hour=16, minute=0, timezone=TIMEZONE),id="weekly_spend_report", replace_existing=True)
+scheduler.add_job(daily_spend_report,  CronTrigger(hour=21, minute=0, timezone=TIMEZONE),                   id="daily_spend_report",  replace_existing=True)
+scheduler.add_job(keep_alive,          "interval", minutes=5,                                               id="keep_alive",          replace_existing=True)
 scheduler.start()
 print(f"Scheduler started. Morning briefing at {BRIEFING_HOUR}:00 {TIMEZONE}")
 
+# ── ROUTES ──
 @app.route("/")
-def index():
-    return jsonify({"status": "Reed AI Backend Running", "time": datetime.now().isoformat()})
+def index(): return jsonify({"status": "Reed AI Backend Running", "time": datetime.now().isoformat()})
 
 @app.route("/ping")
-def ping():
-    return jsonify({"ok": True})
+def ping(): return jsonify({"ok": True})
 
 @app.route("/test-sms")
 def test_sms():
-    send_whatsapp("Reed AI Is Online And Running. Your Morning Briefings And Job Alerts Are Active. 🤖")
+    send_whatsapp("Reed AI Is Online And Running. 🤖")
     return jsonify({"sent": True})
 
-@app.route("/run-briefing")
-def run_briefing_route():
-    morning_briefing()
-    return jsonify({"ran": "morning_briefing"})
+@app.route("/agent/status")
+def agent_status():
+    return jsonify({"online": True, "scheduler": scheduler.state == STATE_RUNNING,
+        "next_briefing": str(scheduler.get_job("morning_briefing").next_run_time),
+        "next_job_scan": str(scheduler.get_job("job_scan").next_run_time)})
 
-@app.route("/run-jobs")
-def run_jobs_route():
-    job_scan()
-    return jsonify({"ran": "job_scan"})
+@app.route("/agent/spend")
+def agent_spend():
+    data = load_json("daily_api_spend.json", {"date":"","input_tokens":0,"output_tokens":0,"calls":0})
+    cost = (data.get("input_tokens",0)/1e6*3.0) + (data.get("output_tokens",0)/1e6*15.0)
+    return jsonify({**data, "estimated_cost_usd": round(cost, 4)})
 
-@app.route("/agent/scan-jobs", methods=["POST", "GET"])
+@app.route("/agent/scan-jobs", methods=["POST","GET"])
 def agent_scan_jobs():
-    t = threading.Thread(target=run_agent_job_scan)
-    t.daemon = True
-    t.start()
+    threading.Thread(target=run_agent_job_scan, daemon=True).start()
     return jsonify({"started": True})
 
-@app.route("/agent/briefing", methods=["POST", "GET"])
+@app.route("/agent/briefing", methods=["POST","GET"])
 def agent_briefing():
-    t = threading.Thread(target=run_agent_briefing)
-    t.daemon = True
-    t.start()
+    threading.Thread(target=morning_briefing, daemon=True).start()
+    return jsonify({"started": True})
+
+@app.route("/agent/news", methods=["POST","GET"])
+def agent_news():
+    threading.Thread(target=evening_news, daemon=True).start()
+    return jsonify({"started": True})
+
+@app.route("/agent/checkin", methods=["POST","GET"])
+def agent_checkin():
+    threading.Thread(target=mood_checkin, daemon=True).start()
     return jsonify({"started": True})
 
 @app.route("/agent/task", methods=["POST"])
@@ -280,136 +293,38 @@ def agent_task():
     task_type = data.get("type", "custom")
     prompt = data.get("prompt", "")
     if not prompt and task_type == "custom":
-        return jsonify({"error": "No prompt provided"}), 400
-    t = threading.Thread(target=run_agent_task, args=(task_type, prompt))
-    t.daemon = True
-    t.start()
-    return jsonify({"started": True})
-
-@app.route("/agent/news", methods=["POST", "GET"])
-def agent_news():
-    t = threading.Thread(target=evening_news)
-    t.daemon = True
-    t.start()
-    return jsonify({"started": True})
-
-@app.route("/agent/checkin", methods=["POST", "GET"])
-def agent_checkin():
-    t = threading.Thread(target=mood_checkin)
-    t.daemon = True
-    t.start()
-    return jsonify({"started": True})
-
-@app.route("/agent/savings", methods=["POST", "GET"])
-def agent_savings():
-    t = threading.Thread(target=weekly_savings)
-    t.daemon = True
-    t.start()
+        return jsonify({"error": "No prompt"}), 400
+    threading.Thread(target=run_agent_task, args=(task_type, prompt), daemon=True).start()
     return jsonify({"started": True})
 
 @app.route("/agent/savings/add", methods=["POST"])
 def agent_savings_add():
     data = request.get_json() or {}
     amount = float(data.get("amount", 0))
-    note = data.get("note", "")
-    savings = load_savings()
-    savings["total"] = savings.get("total", 0) + amount
-    savings.setdefault("entries", []).append({
-        "amount": amount,
-        "note": note,
-        "date": datetime.now().strftime("%Y-%m-%d")
-    })
-    save_savings(savings)
-    return jsonify({"total": savings["total"], "added": amount})
-
-@app.route("/agent/spend/log", methods=["POST"])
-def agent_log_spend():
-    data = request.get_json() or {}
-    amount = float(data.get("amount", 0))
-    note = data.get("note", "")
-    spend_data = load_personal_spend()
-    spend_data.setdefault("entries", []).append({
-        "amount": amount,
-        "note": note,
-        "date": datetime.now().strftime("%Y-%m-%d")
-    })
-    save_personal_spend(spend_data)
-    return jsonify({"logged": True, "amount": amount})
-
-@app.route("/agent/spend/history", methods=["GET"])
-def agent_spend_history():
-    return jsonify(load_personal_spend())
-
-@app.route("/agent/savings/get", methods=["GET"])
-def agent_savings_get():
-    return jsonify(load_savings())
-
-@app.route("/agent/news", methods=["POST", "GET"])
-def agent_news():
-    t = threading.Thread(target=evening_news)
-    t.daemon = True
-    t.start()
-    return jsonify({"started": True})
-
-@app.route("/agent/checkin", methods=["POST", "GET"])
-def agent_checkin():
-    t = threading.Thread(target=mood_checkin)
-    t.daemon = True
-    t.start()
-    return jsonify({"started": True})
-
-@app.route("/agent/savings", methods=["POST", "GET"])
-def agent_savings_route():
-    t = threading.Thread(target=weekly_savings)
-    t.daemon = True
-    t.start()
-    return jsonify({"started": True})
-
-@app.route("/agent/savings/add", methods=["POST"])
-def agent_savings_add():
-    data = request.get_json() or {}
-    amount = float(data.get("amount", 0))
-    note = data.get("note", "")
-    sav = load_savings()
+    sav = load_json("savings.json", {"total": 0, "entries": []})
     sav["total"] = sav.get("total", 0) + amount
-    sav.setdefault("entries", []).append({"amount": amount, "note": note, "date": datetime.now().strftime("%Y-%m-%d")})
-    save_savings(sav)
+    sav.setdefault("entries", []).append({"amount": amount, "note": data.get("note",""), "date": datetime.now().strftime("%Y-%m-%d")})
+    save_json("savings.json", sav)
     return jsonify({"total": sav["total"], "added": amount})
 
-@app.route("/agent/savings/get", methods=["GET"])
+@app.route("/agent/savings/get")
 def agent_savings_get():
-    return jsonify(load_savings())
+    return jsonify(load_json("savings.json", {"total": 0, "entries": []}))
 
 @app.route("/agent/spend/log", methods=["POST"])
 def agent_log_spend():
     data = request.get_json() or {}
     amount = float(data.get("amount", 0))
-    note = data.get("note", "")
-    spend_data = load_personal_spend()
-    spend_data.setdefault("entries", []).append({"amount": amount, "note": note, "date": datetime.now().strftime("%Y-%m-%d")})
-    save_personal_spend(spend_data)
+    spend_data = load_json("daily_personal_spend.json", {"entries": []})
+    spend_data.setdefault("entries", []).append({"amount": amount, "note": data.get("note",""), "date": datetime.now().strftime("%Y-%m-%d")})
+    save_json("daily_personal_spend.json", spend_data)
     return jsonify({"logged": True, "amount": amount})
 
-@app.route("/agent/spend/history", methods=["GET"])
+@app.route("/agent/spend/history")
 def agent_spend_history():
-    return jsonify(load_personal_spend())
-
-@app.route("/agent/spend", methods=["GET"])
-def agent_spend():
-    data = load_spend()
-    cost = calc_cost(data.get("input_tokens",0), data.get("output_tokens",0))
-    return jsonify({**data, "estimated_cost_usd": round(cost, 4)})
-
-@app.route("/agent/status", methods=["GET"])
-def agent_status():
-    return jsonify({
-        "online": True,
-        "scheduler": scheduler.state == STATE_RUNNING,
-        "next_briefing": str(scheduler.get_job("morning_briefing").next_run_time) if scheduler.get_job("morning_briefing") else None,
-        "next_job_scan": str(scheduler.get_job("job_scan").next_run_time) if scheduler.get_job("job_scan") else None,
-    })
+    return jsonify(load_json("daily_personal_spend.json", {"entries": []}))
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
