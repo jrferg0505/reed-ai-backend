@@ -41,7 +41,6 @@ def send_sms(body):
             body=body,
             from_="whatsapp:" + TWILIO_FROM,
             to="whatsapp:" + REED_PHONE
-            to=REED_PHONE
         )
         print(f"SMS sent: {body[:60]}...")
     except Exception as e:
