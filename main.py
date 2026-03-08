@@ -85,19 +85,26 @@ def ask_claude(prompt, use_search=False, max_tokens=1024):
     for block in data.get("content", []):
         if block.get("type") == "text":
             text += block["text"]
+    # Track spend
+    try:
+        usage = data.get("usage", {})
+        track_spend(usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+    except:
+        pass
     return text.strip()
 
 def morning_briefing():
     print("Running morning briefing...")
     try:
-        prompt = """Give Reed his morning briefing. Keep it under 300 characters total.
-Reed is job hunting (wants 9-5 office work, no degree needed, Indianapolis area), saving for a car, learning AI.
-Format exactly like this (use line breaks):
+        prompt = """Give Reed his morning briefing. Search the web for Indianapolis weather today.
+Format exactly like this (use line breaks, keep total under 400 characters):
 Good Morning Reed 🌅
-[One sentence: weather vibe or motivation for today]
-🎯 Focus: [One specific thing he should do today toward his goals]
-💼 Job Tip: [One quick actionable job search tip]
-Keep it punchy, real, no fluff."""
+☀️ Weather: [Today's Indianapolis weather — temp + conditions in one line]
+💬 [One punchy motivational quote — real, not cheesy]
+🎯 Focus: [One specific action toward his goals today]
+💼 Job Tip: [One quick actionable job search tip for today]
+
+Reed: Indianapolis, hunting for $18+/hr office job, saving for car, learning AI. Be direct, capitalize every word."""
         text = ask_claude(prompt, use_search=True)
         send_whatsapp(text)
         print("Morning briefing sent.")
@@ -206,6 +213,22 @@ scheduler = BackgroundScheduler(timezone=TIMEZONE)
 scheduler.add_job(morning_briefing, CronTrigger(hour=BRIEFING_HOUR, minute=0, timezone=TIMEZONE), id="morning_briefing", replace_existing=True)
 scheduler.add_job(job_scan, CronTrigger(hour="*/6", minute=30, timezone=TIMEZONE), id="job_scan", replace_existing=True)
 scheduler.add_job(weekly_recap, CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=TIMEZONE), id="weekly_recap", replace_existing=True)
+scheduler.add_job(daily_spend_report, CronTrigger(hour=21, minute=0, timezone=TIMEZONE), id="spend_report", replace_existing=True)
+scheduler.add_job(evening_news, CronTrigger(hour=19, minute=0, timezone=TIMEZONE), id="evening_news", replace_existing=True)
+scheduler.add_job(mood_checkin, CronTrigger(hour=21, minute=30, timezone=TIMEZONE), id="mood_checkin", replace_existing=True)
+scheduler.add_job(weekly_savings, CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=TIMEZONE), id="weekly_savings", replace_existing=True)
+scheduler.add_job(daily_spend_ask, CronTrigger(hour=22, minute=0, timezone=TIMEZONE), id="daily_spend_ask", replace_existing=True)
+scheduler.add_job(weekly_spend_report, CronTrigger(day_of_week="tue", hour=16, minute=0, timezone=TIMEZONE), id="weekly_spend_report", replace_existing=True)
+
+# Keep-alive — ping self every 5 minutes so Render never spins down
+def keep_alive():
+    try:
+        requests.get("https://reed-ai-backend.onrender.com/ping", timeout=10)
+        print("Keep-alive ping sent.")
+    except Exception as e:
+        print(f"Keep-alive error: {e}")
+
+scheduler.add_job(keep_alive, "interval", minutes=5, id="keep_alive", replace_existing=True)
 scheduler.start()
 print(f"Scheduler started. Morning briefing at {BRIEFING_HOUR}:00 {TIMEZONE}")
 
@@ -258,6 +281,70 @@ def agent_task():
     t.start()
     return jsonify({"started": True})
 
+@app.route("/agent/news", methods=["POST", "GET"])
+def agent_news():
+    t = threading.Thread(target=evening_news)
+    t.daemon = True
+    t.start()
+    return jsonify({"started": True})
+
+@app.route("/agent/checkin", methods=["POST", "GET"])
+def agent_checkin():
+    t = threading.Thread(target=mood_checkin)
+    t.daemon = True
+    t.start()
+    return jsonify({"started": True})
+
+@app.route("/agent/savings", methods=["POST", "GET"])
+def agent_savings():
+    t = threading.Thread(target=weekly_savings)
+    t.daemon = True
+    t.start()
+    return jsonify({"started": True})
+
+@app.route("/agent/savings/add", methods=["POST"])
+def agent_savings_add():
+    data = request.get_json() or {}
+    amount = float(data.get("amount", 0))
+    note = data.get("note", "")
+    savings = load_savings()
+    savings["total"] = savings.get("total", 0) + amount
+    savings.setdefault("entries", []).append({
+        "amount": amount,
+        "note": note,
+        "date": datetime.now().strftime("%Y-%m-%d")
+    })
+    save_savings(savings)
+    return jsonify({"total": savings["total"], "added": amount})
+
+@app.route("/agent/spend/log", methods=["POST"])
+def agent_log_spend():
+    data = request.get_json() or {}
+    amount = float(data.get("amount", 0))
+    note = data.get("note", "")
+    spend_data = load_personal_spend()
+    spend_data.setdefault("entries", []).append({
+        "amount": amount,
+        "note": note,
+        "date": datetime.now().strftime("%Y-%m-%d")
+    })
+    save_personal_spend(spend_data)
+    return jsonify({"logged": True, "amount": amount})
+
+@app.route("/agent/spend/history", methods=["GET"])
+def agent_spend_history():
+    return jsonify(load_personal_spend())
+
+@app.route("/agent/savings/get", methods=["GET"])
+def agent_savings_get():
+    return jsonify(load_savings())
+
+@app.route("/agent/spend", methods=["GET"])
+def agent_spend():
+    data = load_spend()
+    cost = calc_cost(data.get("input_tokens",0), data.get("output_tokens",0))
+    return jsonify({**data, "estimated_cost_usd": round(cost, 4)})
+
 @app.route("/agent/status", methods=["GET"])
 def agent_status():
     return jsonify({
@@ -270,3 +357,4 @@ def agent_status():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
