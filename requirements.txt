@@ -1,0 +1,7 @@
+flask==3.0.3
+anthropic==0.49.0
+twilio==9.3.7
+apscheduler==3.10.4
+requests==2.32.3
+pytz==2024.1
+gunicorn==22.0.0
