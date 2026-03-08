@@ -39,7 +39,8 @@ def send_sms(body):
         client = Client(TWILIO_SID, TWILIO_TOKEN)
         client.messages.create(
             body=body,
-            from_=TWILIO_FROM,
+            from_="whatsapp:" + TWILIO_FROM,
+            to="whatsapp:" + REED_PHONE
             to=REED_PHONE
         )
         print(f"SMS sent: {body[:60]}...")
