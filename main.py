@@ -229,6 +229,11 @@ def keep_alive():
         print(f"Keep-alive error: {e}")
 
 scheduler.add_job(keep_alive, "interval", minutes=5, id="keep_alive", replace_existing=True)
+scheduler.add_job(evening_news, CronTrigger(hour=19, minute=0, timezone=TIMEZONE), id="evening_news", replace_existing=True)
+scheduler.add_job(mood_checkin, CronTrigger(hour=21, minute=30, timezone=TIMEZONE), id="mood_checkin", replace_existing=True)
+scheduler.add_job(weekly_savings, CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=TIMEZONE), id="weekly_savings", replace_existing=True)
+scheduler.add_job(daily_spend_ask, CronTrigger(hour=22, minute=0, timezone=TIMEZONE), id="daily_spend_ask", replace_existing=True)
+scheduler.add_job(weekly_spend_report, CronTrigger(day_of_week="tue", hour=16, minute=0, timezone=TIMEZONE), id="weekly_spend_report", replace_existing=True)
 scheduler.start()
 print(f"Scheduler started. Morning briefing at {BRIEFING_HOUR}:00 {TIMEZONE}")
 
@@ -338,6 +343,56 @@ def agent_spend_history():
 @app.route("/agent/savings/get", methods=["GET"])
 def agent_savings_get():
     return jsonify(load_savings())
+
+@app.route("/agent/news", methods=["POST", "GET"])
+def agent_news():
+    t = threading.Thread(target=evening_news)
+    t.daemon = True
+    t.start()
+    return jsonify({"started": True})
+
+@app.route("/agent/checkin", methods=["POST", "GET"])
+def agent_checkin():
+    t = threading.Thread(target=mood_checkin)
+    t.daemon = True
+    t.start()
+    return jsonify({"started": True})
+
+@app.route("/agent/savings", methods=["POST", "GET"])
+def agent_savings_route():
+    t = threading.Thread(target=weekly_savings)
+    t.daemon = True
+    t.start()
+    return jsonify({"started": True})
+
+@app.route("/agent/savings/add", methods=["POST"])
+def agent_savings_add():
+    data = request.get_json() or {}
+    amount = float(data.get("amount", 0))
+    note = data.get("note", "")
+    sav = load_savings()
+    sav["total"] = sav.get("total", 0) + amount
+    sav.setdefault("entries", []).append({"amount": amount, "note": note, "date": datetime.now().strftime("%Y-%m-%d")})
+    save_savings(sav)
+    return jsonify({"total": sav["total"], "added": amount})
+
+@app.route("/agent/savings/get", methods=["GET"])
+def agent_savings_get():
+    return jsonify(load_savings())
+
+@app.route("/agent/spend/log", methods=["POST"])
+def agent_log_spend():
+    data = request.get_json() or {}
+    amount = float(data.get("amount", 0))
+    note = data.get("note", "")
+    spend_data = load_personal_spend()
+    spend_data.setdefault("entries", []).append({"amount": amount, "note": note, "date": datetime.now().strftime("%Y-%m-%d")})
+    save_personal_spend(spend_data)
+    return jsonify({"logged": True, "amount": amount})
+
+@app.route("/agent/spend/history", methods=["GET"])
+def agent_spend_history():
+    return jsonify(load_personal_spend())
 
 @app.route("/agent/spend", methods=["GET"])
 def agent_spend():
