@@ -108,10 +108,12 @@ def job_scan():
     print("Running job scan...")
     try:
         seen = load_seen()
-        prompt = """Search for real, currently open job listings in Indianapolis Indiana and remote roles for someone with no degree who wants a 9-5 office job. Look for: office coordinator, admin assistant, customer success rep, sales rep, front desk, scheduling coordinator, operations assistant, receptionist, data entry specialist.
+        prompt = """Search Indeed, LinkedIn, ZipRecruiter, and Google Jobs for real currently open office jobs in Indianapolis Indiana. Requirements: no college degree required, pay $18/hour or more (or $37,000+ salary), in-person office work (no remote), Monday-Friday schedule. Look for roles like: office coordinator, admin assistant, customer success rep, inside sales rep, front desk coordinator, scheduling coordinator, operations assistant, receptionist, account manager, office manager, data entry specialist, or any similar professional office role.
+
 Return ONLY a JSON array, no other text:
-[{"title":"Job Title","company":"Company","location":"City ST or Remote","pay":"$X/hr or $Xk","id":"company-title-location-slug"}]
-Return up to 5 jobs. Real listings only."""
+[{"title":"Job Title","company":"Company","location":"City, IN","pay":"$X/hr or $Xk/yr","id":"company-title-city-slug"}]
+
+Return up to 5 real current listings only. Skip anything under $18/hr or that requires a degree."""
         result = ask_claude(prompt, use_search=True)
         import re
         match = re.search(r'\[.*\]', result, re.DOTALL)
@@ -150,10 +152,12 @@ This Week: [One concrete action to take]"""
 def run_agent_job_scan():
     try:
         send_whatsapp("🤖 Starting Job Scan Now. I'll Text You What I Find...")
-        prompt = """Search for real, currently open job listings in Indianapolis Indiana and remote roles for someone with no degree who wants a 9-5 office job. Look for: office coordinator, admin assistant, customer success rep, sales rep, front desk, scheduling coordinator, operations assistant, data entry specialist.
+        prompt = """Search Indeed, LinkedIn, ZipRecruiter, and Google Jobs for real currently open office jobs in Indianapolis Indiana. Requirements: no college degree required, pay $18/hour or more (or $37,000+ salary), in-person office work only (no remote), Monday-Friday schedule. Look for: office coordinator, admin assistant, customer success rep, inside sales rep, front desk coordinator, scheduling coordinator, operations assistant, receptionist, account manager, data entry specialist, or similar professional office roles.
+
 Return ONLY a JSON array, no other text:
-[{"title":"Job Title","company":"Company","location":"City ST or Remote","pay":"$X/hr or $Xk","applyUrl":"url or empty string","id":"company-title-location-slug"}]
-Return up to 5 real current listings."""
+[{"title":"Job Title","company":"Company","location":"City, IN","pay":"$X/hr or $Xk/yr","applyUrl":"direct job listing URL or empty string","id":"company-title-city-slug"}]
+
+Return up to 5 real current listings. Skip anything under $18/hr or that requires a degree."""
         result = ask_claude(prompt, use_search=True, max_tokens=2048)
         import re
         match = re.search(r'\[.*\]', result, re.DOTALL)
