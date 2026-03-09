@@ -231,7 +231,7 @@ def run_agent_task(task_type, custom_prompt=None):
 # ── SCHEDULER ──
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
 scheduler.add_job(morning_briefing,    CronTrigger(hour=BRIEFING_HOUR, minute=0, timezone=TIMEZONE),        id="morning_briefing",    replace_existing=True)
-scheduler.add_job(job_scan,            CronTrigger(hour="*/6", minute=30, timezone=TIMEZONE),               id="job_scan",            replace_existing=True)
+scheduler.add_job(job_scan,            CronTrigger(hour=9, minute=0, timezone=TIMEZONE),                    id="job_scan",            replace_existing=True)
 scheduler.add_job(evening_news,        CronTrigger(hour=19, minute=0, timezone=TIMEZONE),                   id="evening_news",        replace_existing=True)
 scheduler.add_job(mood_checkin,        CronTrigger(hour=21, minute=30, timezone=TIMEZONE),                  id="mood_checkin",        replace_existing=True)
 scheduler.add_job(weekly_recap,        CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=TIMEZONE),id="weekly_recap",        replace_existing=True)
@@ -326,5 +326,3 @@ def agent_spend_history():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
-
