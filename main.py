@@ -751,12 +751,14 @@ def gmail_status():
     creds = get_gmail_creds()
     if not creds:
         return jsonify({"connected": False})
+    # Token is valid — try to get the email address but don't fail if Gmail API
+    # isn't enabled in Cloud Console yet; creds existing is enough to show connected.
     try:
         svc = get_gmail_service()
         profile = svc.users().getProfile(userId="me").execute()
         return jsonify({"connected": True, "email": profile.get("emailAddress", "")})
-    except Exception as e:
-        return jsonify({"connected": False, "error": str(e)})
+    except Exception:
+        return jsonify({"connected": True, "email": ""})
 
 @app.route("/gmail/inbox")
 def gmail_inbox():
