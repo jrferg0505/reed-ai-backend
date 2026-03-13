@@ -504,24 +504,20 @@ def wa_send():
 
 @app.route("/gcal/auth")
 def gcal_auth():
-    """Start OAuth flow — redirect user to Google consent screen."""
+    """Start OAuth flow — build auth URL manually, no PKCE."""
+    import urllib.parse
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
         return jsonify({"error": "Google credentials not configured in Render env vars"}), 400
-    flow = Flow.from_client_config(
-        {"web": {
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_REDIRECT_URI]
-        }},
-        scopes=GCAL_SCOPES,
-        redirect_uri=GOOGLE_REDIRECT_URI
-    )
-    flow.code_verifier = None  # disable PKCE — server-side flow doesn't need it
-    auth_url, _ = flow.authorization_url(
-        access_type="offline", include_granted_scopes="true", prompt="consent"
-    )
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GCAL_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/auth?" + urllib.parse.urlencode(params)
     return jsonify({"auth_url": auth_url})
 
 @app.route("/gcal/callback")
