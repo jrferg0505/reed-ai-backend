@@ -36,7 +36,7 @@ def send_whatsapp(body):
 
 def ask_claude(prompt, use_search=False, max_tokens=1024):
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
-    body = {"model": "claude-sonnet-4-20250514", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}
+    body = {"model": "claude-sonnet-4-5", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}
     if use_search:
         headers["anthropic-beta"] = "web-search-2025-03-05"
         body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
@@ -45,7 +45,7 @@ def ask_claude(prompt, use_search=False, max_tokens=1024):
     if data.get("error"): raise Exception(data["error"]["message"])
     if data.get("stop_reason") == "tool_use" and use_search:
         r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json={
-            "model": "claude-sonnet-4-20250514", "max_tokens": max_tokens,
+            "model": "claude-sonnet-4-5", "max_tokens": max_tokens,
             "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
             "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": data["content"]}]})
         data = r.json()
