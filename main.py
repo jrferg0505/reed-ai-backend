@@ -1,4 +1,8 @@
 import os, json, re, requests, threading
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request as GRequest
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.base import STATE_RUNNING
@@ -16,6 +20,10 @@ TWILIO_TOKEN  = os.environ.get("TWILIO_TOKEN")
 TWILIO_FROM   = os.environ.get("TWILIO_FROM")
 REED_PHONE    = os.environ.get("REED_PHONE")
 BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "8"))
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI", "https://reed-ai-backend.onrender.com/gcal/callback")
+GCAL_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 
 def load_json(path, default):
@@ -66,6 +74,8 @@ def ask_claude(prompt, use_search=False, max_tokens=1024):
 def morning_briefing():
     print("Running morning briefing...")
     try:
+        cal_text = gcal_events_text(days=1)
+        cal_section = f"\n📅 Today's Schedule:\n{cal_text}" if cal_text and cal_text != "No upcoming events." else ""
         text = ask_claude("""Search for Indianapolis weather today. Give Reed his morning briefing.
 Format (under 400 chars, use line breaks):
 Good Morning Reed 🌅
@@ -244,6 +254,60 @@ scheduler.start()
 print(f"Scheduler started. Morning briefing at {BRIEFING_HOUR}:00 {TIMEZONE}")
 
 # ── ROUTES ──
+# ── Google Calendar helpers ──
+def gcal_token_path():
+    return "gcal_token.json"
+
+def get_gcal_creds():
+    path = gcal_token_path()
+    if not os.path.exists(path):
+        return None
+    creds = Credentials.from_authorized_user_file(path, GCAL_SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GRequest())
+            with open(path, "w") as f:
+                f.write(creds.to_json())
+        except Exception as e:
+            print(f"Token refresh error: {e}")
+            return None
+    return creds if (creds and creds.valid) else None
+
+def get_gcal_service():
+    creds = get_gcal_creds()
+    if not creds:
+        return None
+    return build("calendar", "v3", credentials=creds)
+
+def gcal_events_text(days=3):
+    """Get upcoming events as plain text for briefings."""
+    try:
+        svc = get_gcal_service()
+        if not svc:
+            return ""
+        now = datetime.utcnow().isoformat() + "Z"
+        end = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+        result = svc.events().list(
+            calendarId="primary", timeMin=now, timeMax=end,
+            maxResults=10, singleEvents=True, orderBy="startTime"
+        ).execute()
+        events = result.get("items", [])
+        if not events:
+            return "No upcoming events."
+        lines = []
+        for e in events:
+            start = e["start"].get("dateTime", e["start"].get("date", ""))
+            try:
+                dt = datetime.fromisoformat(start.replace("Z",""))
+                fmt = dt.strftime("%a %b %d, %I:%M %p")
+            except:
+                fmt = start
+            lines.append(f"- {fmt}: {e.get('summary','(no title)')}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"gcal_events_text error: {e}")
+        return ""
+
 @app.route("/")
 def index(): return jsonify({"status": "Reed AI Backend Running", "time": datetime.now().isoformat()})
 
@@ -432,6 +496,165 @@ def wa_send():
     except Exception as e:
         print(f"WA send error: {e}")
         return jsonify({"error": str(e)}), 500
+
+# ── Google Calendar Routes ──
+
+@app.route("/gcal/auth")
+def gcal_auth():
+    """Start OAuth flow — redirect user to Google consent screen."""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return jsonify({"error": "Google credentials not configured in Render env vars"}), 400
+    flow = Flow.from_client_config(
+        {"web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [GOOGLE_REDIRECT_URI]
+        }},
+        scopes=GCAL_SCOPES,
+        redirect_uri=GOOGLE_REDIRECT_URI
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline", include_granted_scopes="true", prompt="consent"
+    )
+    return jsonify({"auth_url": auth_url})
+
+@app.route("/gcal/callback")
+def gcal_callback():
+    """Google redirects here after consent. Save token."""
+    code = request.args.get("code")
+    if not code:
+        return "<h2>Error: no code returned from Google</h2>", 400
+    flow = Flow.from_client_config(
+        {"web": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [GOOGLE_REDIRECT_URI]
+        }},
+        scopes=GCAL_SCOPES,
+        redirect_uri=GOOGLE_REDIRECT_URI
+    )
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    with open(gcal_token_path(), "w") as f:
+        f.write(creds.to_json())
+    return """<html><body style='background:#000;color:#fff;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;'>
+    <div style='font-size:48px;'>✓</div>
+    <div style='font-size:20px;font-weight:600;'>Google Calendar Connected</div>
+    <div style='color:rgba(255,255,255,0.5);font-size:15px;'>You can close this tab and return to Onyx.</div>
+    </body></html>"""
+
+@app.route("/gcal/status")
+def gcal_status():
+    creds = get_gcal_creds()
+    if not creds:
+        return jsonify({"connected": False})
+    try:
+        svc = get_gcal_service()
+        cal = svc.calendars().get(calendarId="primary").execute()
+        return jsonify({"connected": True, "email": cal.get("id","")})
+    except:
+        return jsonify({"connected": False})
+
+@app.route("/gcal/events")
+def gcal_events():
+    """Get upcoming events. ?days=7 optional."""
+    days = int(request.args.get("days", 7))
+    try:
+        svc = get_gcal_service()
+        if not svc:
+            return jsonify({"error": "not_connected"}), 401
+        now = datetime.utcnow().isoformat() + "Z"
+        end = (datetime.utcnow() + timedelta(days=days)).isoformat() + "Z"
+        result = svc.events().list(
+            calendarId="primary", timeMin=now, timeMax=end,
+            maxResults=25, singleEvents=True, orderBy="startTime"
+        ).execute()
+        events = []
+        for e in result.get("items", []):
+            start = e["start"].get("dateTime", e["start"].get("date",""))
+            end_t = e["end"].get("dateTime", e["end"].get("date",""))
+            events.append({
+                "id":       e["id"],
+                "title":    e.get("summary","(no title)"),
+                "start":    start,
+                "end":      end_t,
+                "location": e.get("location",""),
+                "desc":     e.get("description",""),
+                "link":     e.get("htmlLink",""),
+                "allDay":   "T" not in e["start"].get("dateTime","T")
+            })
+        return jsonify({"events": events})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/gcal/create", methods=["POST"])
+def gcal_create():
+    """Create a new event."""
+    data = request.get_json() or {}
+    try:
+        svc = get_gcal_service()
+        if not svc:
+            return jsonify({"error": "not_connected"}), 401
+        event_body = {
+            "summary": data.get("title", "New Event"),
+            "location": data.get("location", ""),
+            "description": data.get("desc", ""),
+            "start": {"dateTime": data["start"], "timeZone": TIMEZONE},
+            "end":   {"dateTime": data["end"],   "timeZone": TIMEZONE},
+        }
+        created = svc.events().insert(calendarId="primary", body=event_body).execute()
+        return jsonify({"created": True, "id": created["id"], "link": created.get("htmlLink","")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/gcal/update", methods=["POST"])
+def gcal_update():
+    """Update an existing event."""
+    data = request.get_json() or {}
+    event_id = data.get("id")
+    if not event_id:
+        return jsonify({"error": "No event id"}), 400
+    try:
+        svc = get_gcal_service()
+        if not svc:
+            return jsonify({"error": "not_connected"}), 401
+        event = svc.events().get(calendarId="primary", eventId=event_id).execute()
+        if "title" in data:   event["summary"]     = data["title"]
+        if "location" in data: event["location"]    = data["location"]
+        if "desc" in data:    event["description"] = data["desc"]
+        if "start" in data:   event["start"]       = {"dateTime": data["start"], "timeZone": TIMEZONE}
+        if "end" in data:     event["end"]         = {"dateTime": data["end"],   "timeZone": TIMEZONE}
+        updated = svc.events().update(calendarId="primary", eventId=event_id, body=event).execute()
+        return jsonify({"updated": True, "id": updated["id"]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/gcal/delete", methods=["POST"])
+def gcal_delete():
+    """Delete an event."""
+    data = request.get_json() or {}
+    event_id = data.get("id")
+    if not event_id:
+        return jsonify({"error": "No event id"}), 400
+    try:
+        svc = get_gcal_service()
+        if not svc:
+            return jsonify({"error": "not_connected"}), 401
+        svc.events().delete(calendarId="primary", eventId=event_id).execute()
+        return jsonify({"deleted": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/gcal/disconnect", methods=["POST"])
+def gcal_disconnect():
+    path = gcal_token_path()
+    if os.path.exists(path):
+        os.remove(path)
+    return jsonify({"disconnected": True})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
