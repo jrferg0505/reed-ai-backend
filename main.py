@@ -1,4 +1,5 @@
-import os, json, re, requests, threading
+import os, json, re, requests, threading, base64
+from email.mime.text import MIMEText
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -26,6 +27,11 @@ GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI", "https://reed-ai-ba
 GCAL_SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
+]
+GMAIL_REDIRECT_URI = os.environ.get("GMAIL_REDIRECT_URI", "https://reed-ai-backend.onrender.com/gmail/callback")
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
 ]
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 
@@ -661,6 +667,187 @@ def gcal_delete():
 @app.route("/gcal/disconnect", methods=["POST"])
 def gcal_disconnect():
     path = gcal_token_path()
+    if os.path.exists(path):
+        os.remove(path)
+    return jsonify({"disconnected": True})
+
+# ── Gmail helpers ──
+def gmail_token_path():
+    return "gmail_token.json"
+
+def get_gmail_creds():
+    path = gmail_token_path()
+    if not os.path.exists(path):
+        return None
+    creds = Credentials.from_authorized_user_file(path, GMAIL_SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GRequest())
+            with open(path, "w") as f:
+                f.write(creds.to_json())
+        except Exception as e:
+            print(f"Gmail token refresh error: {e}")
+            return None
+    return creds if (creds and creds.valid) else None
+
+def get_gmail_service():
+    creds = get_gmail_creds()
+    if not creds:
+        return None
+    return build("gmail", "v1", credentials=creds)
+
+@app.route("/gmail/auth")
+def gmail_auth():
+    import urllib.parse
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        return jsonify({"error": "Google credentials not configured"}), 400
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GMAIL_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GMAIL_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/auth?" + urllib.parse.urlencode(params)
+    return jsonify({"auth_url": auth_url})
+
+@app.route("/gmail/callback")
+def gmail_callback():
+    code = request.args.get("code")
+    if not code:
+        return "<h2>Error: no code returned from Google</h2>", 400
+    token_resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": GMAIL_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+    )
+    token_data = token_resp.json()
+    if "error" in token_data:
+        return f"<h2>Token exchange error: {token_data.get('error_description', token_data.get('error'))}</h2>", 400
+    creds = Credentials(
+        token=token_data["access_token"],
+        refresh_token=token_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=GMAIL_SCOPES,
+    )
+    with open(gmail_token_path(), "w") as f:
+        f.write(creds.to_json())
+    return """<html><head><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0a0a0a;color:#fff;}
+    .card{text-align:center;padding:40px;background:#1a1a1a;border-radius:16px;border:1px solid #333;}
+    h2{color:#4ade80;margin:0 0 12px;}p{color:#999;margin:0;}</style></head>
+    <body><div class="card"><h2>✓ Gmail Connected</h2><p>You can close this tab and return to Onyx.</p></div></body></html>"""
+
+@app.route("/gmail/status")
+def gmail_status():
+    creds = get_gmail_creds()
+    if not creds:
+        return jsonify({"connected": False})
+    try:
+        svc = get_gmail_service()
+        profile = svc.users().getProfile(userId="me").execute()
+        return jsonify({"connected": True, "email": profile.get("emailAddress", "")})
+    except Exception as e:
+        return jsonify({"connected": False, "error": str(e)})
+
+@app.route("/gmail/inbox")
+def gmail_inbox():
+    """Return recent unread emails."""
+    try:
+        svc = get_gmail_service()
+        if not svc:
+            return jsonify({"error": "not_connected"}), 401
+        max_results = int(request.args.get("max", 10))
+        result = svc.users().messages().list(
+            userId="me", labelIds=["INBOX", "UNREAD"], maxResults=max_results
+        ).execute()
+        msgs = result.get("messages", [])
+        emails = []
+        for m in msgs:
+            msg = svc.users().messages().get(userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["Subject","From","Date"]).execute()
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            snippet = msg.get("snippet", "")
+            emails.append({
+                "id": m["id"],
+                "threadId": msg.get("threadId", ""),
+                "subject": headers.get("Subject", "(no subject)"),
+                "from": headers.get("From", ""),
+                "date": headers.get("Date", ""),
+                "snippet": snippet,
+            })
+        return jsonify({"emails": emails})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/gmail/important")
+def gmail_important():
+    """Return important/starred emails or emails matching a keyword."""
+    try:
+        svc = get_gmail_service()
+        if not svc:
+            return jsonify({"error": "not_connected"}), 401
+        keyword = request.args.get("q", "")
+        max_results = int(request.args.get("max", 10))
+        query = keyword if keyword else "is:important"
+        result = svc.users().messages().list(
+            userId="me", q=query, maxResults=max_results
+        ).execute()
+        msgs = result.get("messages", [])
+        emails = []
+        for m in msgs:
+            msg = svc.users().messages().get(userId="me", id=m["id"], format="metadata",
+                metadataHeaders=["Subject","From","Date"]).execute()
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            emails.append({
+                "id": m["id"],
+                "threadId": msg.get("threadId", ""),
+                "subject": headers.get("Subject", "(no subject)"),
+                "from": headers.get("From", ""),
+                "date": headers.get("Date", ""),
+                "snippet": msg.get("snippet", ""),
+            })
+        return jsonify({"emails": emails})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/gmail/send", methods=["POST"])
+def gmail_send():
+    """Send an email. Body: {to, subject, body, threadId (optional for reply)}."""
+    try:
+        svc = get_gmail_service()
+        if not svc:
+            return jsonify({"error": "not_connected"}), 401
+        data = request.get_json() or {}
+        to = data.get("to", "")
+        subject = data.get("subject", "")
+        body = data.get("body", "")
+        thread_id = data.get("threadId", "")
+        if not to or not body:
+            return jsonify({"error": "to and body are required"}), 400
+        mime_msg = MIMEText(body)
+        mime_msg["to"] = to
+        mime_msg["subject"] = subject
+        raw = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
+        send_body = {"raw": raw}
+        if thread_id:
+            send_body["threadId"] = thread_id
+        sent = svc.users().messages().send(userId="me", body=send_body).execute()
+        return jsonify({"sent": True, "id": sent["id"]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/gmail/disconnect", methods=["POST"])
+def gmail_disconnect():
+    path = gmail_token_path()
     if os.path.exists(path):
         os.remove(path)
     return jsonify({"disconnected": True})
