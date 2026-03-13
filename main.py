@@ -530,20 +530,28 @@ def gcal_callback():
     code = request.args.get("code")
     if not code:
         return "<h2>Error: no code returned from Google</h2>", 400
-    flow = Flow.from_client_config(
-        {"web": {
+    # Exchange code directly via HTTP POST — bypasses Flow/PKCE entirely
+    token_resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
             "client_id": GOOGLE_CLIENT_ID,
             "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [GOOGLE_REDIRECT_URI]
-        }},
-        scopes=GCAL_SCOPES,
-        redirect_uri=GOOGLE_REDIRECT_URI
+            "redirect_uri": GOOGLE_REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
     )
-    flow.code_verifier = None  # PKCE disabled — must match auth step
-    flow.fetch_token(code=code)
-    creds = flow.credentials
+    token_data = token_resp.json()
+    if "error" in token_data:
+        return f"<h2>Token exchange error: {token_data.get('error_description', token_data.get('error'))}</h2>", 400
+    creds = Credentials(
+        token=token_data["access_token"],
+        refresh_token=token_data.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=GCAL_SCOPES,
+    )
     with open(gcal_token_path(), "w") as f:
         f.write(creds.to_json())
     return """<html><body style='background:#000;color:#fff;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;'>
