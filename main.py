@@ -677,18 +677,29 @@ def gmail_token_path():
 
 def get_gmail_creds():
     path = gmail_token_path()
-    if not os.path.exists(path):
+    abs_path = os.path.abspath(path)
+    exists = os.path.exists(path)
+    print(f"[GMAIL CREDS] path={abs_path} exists={exists}")
+    if not exists:
         return None
-    creds = Credentials.from_authorized_user_file(path, GMAIL_SCOPES)
+    try:
+        creds = Credentials.from_authorized_user_file(path, GMAIL_SCOPES)
+        print(f"[GMAIL CREDS] token_present={bool(creds.token)} expired={creds.expired} expiry={creds.expiry} valid={creds.valid}")
+    except Exception as e:
+        print(f"[GMAIL CREDS] from_authorized_user_file error: {e}")
+        return None
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(GRequest())
             with open(path, "w") as f:
                 f.write(creds.to_json())
+            print(f"[GMAIL CREDS] token refreshed ok")
         except Exception as e:
-            print(f"Gmail token refresh error: {e}")
+            print(f"[GMAIL CREDS] refresh error: {e}")
             return None
-    return creds if (creds and creds.valid) else None
+    result = creds if (creds and creds.valid) else None
+    print(f"[GMAIL CREDS] returning={'valid creds' if result else 'None (creds.valid was False)'}")
+    return result
 
 def get_gmail_service():
     creds = get_gmail_creds()
@@ -729,8 +740,12 @@ def gmail_callback():
         },
     )
     token_data = token_resp.json()
+    print(f"[GMAIL CALLBACK] token exchange keys: {list(token_data.keys())}")
     if "error" in token_data:
+        print(f"[GMAIL CALLBACK] token exchange error: {token_data}")
         return f"<h2>Token exchange error: {token_data.get('error_description', token_data.get('error'))}</h2>", 400
+    from datetime import timezone
+    expiry = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(seconds=int(token_data.get("expires_in", 3600)))
     creds = Credentials(
         token=token_data["access_token"],
         refresh_token=token_data.get("refresh_token"),
@@ -738,9 +753,13 @@ def gmail_callback():
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
         scopes=GMAIL_SCOPES,
+        expiry=expiry,
     )
-    with open(gmail_token_path(), "w") as f:
+    print(f"[GMAIL CALLBACK] creds.valid={creds.valid} creds.expired={creds.expired} expiry={creds.expiry}")
+    token_file = gmail_token_path()
+    with open(token_file, "w") as f:
         f.write(creds.to_json())
+    print(f"[GMAIL CALLBACK] saved token to {os.path.abspath(token_file)}, size={os.path.getsize(token_file)} bytes")
     return """<html><head><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0a0a0a;color:#fff;}
     .card{text-align:center;padding:40px;background:#1a1a1a;border-radius:16px;border:1px solid #333;}
     h2{color:#4ade80;margin:0 0 12px;}p{color:#999;margin:0;}</style></head>
@@ -748,16 +767,20 @@ def gmail_callback():
 
 @app.route("/gmail/status")
 def gmail_status():
+    print("[GMAIL STATUS] request received")
     creds = get_gmail_creds()
     if not creds:
+        print("[GMAIL STATUS] returning connected=false (no valid creds)")
         return jsonify({"connected": False})
-    # Token is valid — try to get the email address but don't fail if Gmail API
-    # isn't enabled in Cloud Console yet; creds existing is enough to show connected.
+    print("[GMAIL STATUS] valid creds found — returning connected=true")
     try:
         svc = get_gmail_service()
         profile = svc.users().getProfile(userId="me").execute()
-        return jsonify({"connected": True, "email": profile.get("emailAddress", "")})
-    except Exception:
+        email = profile.get("emailAddress", "")
+        print(f"[GMAIL STATUS] profile fetch ok, email={email}")
+        return jsonify({"connected": True, "email": email})
+    except Exception as e:
+        print(f"[GMAIL STATUS] profile fetch failed ({e}) — still connected")
         return jsonify({"connected": True, "email": ""})
 
 @app.route("/gmail/inbox")
