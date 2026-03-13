@@ -263,22 +263,66 @@ scheduler.start()
 print(f"Scheduler started. Morning briefing at {BRIEFING_HOUR}:00 {TIMEZONE}")
 
 # ── ROUTES ──
-# ── Google Calendar helpers ──
-def gcal_token_path():
-    return "gcal_token.json"
+# ── Persistent token store ──
+# Primary store: os.environ (in-process, survives Render spin-down within same process).
+# Seeded from GCAL_TOKEN / GMAIL_TOKEN env vars set in the Render dashboard.
+# After first OAuth, copy the logged token JSON into those env vars once — tokens
+# then survive every future redeploy automatically because the refresh_token never expires.
+# Local dev fallback: gcal_token.json / gmail_token.json files still work.
 
+def _save_token(env_key, token_json):
+    """Write token to os.environ (in-process) and to file (local dev fallback)."""
+    os.environ[env_key] = token_json
+    file_path = "gcal_token.json" if env_key == "GCAL_TOKEN" else "gmail_token.json"
+    try:
+        with open(file_path, "w") as f:
+            f.write(token_json)
+    except Exception:
+        pass
+    print(f"[TOKEN] {env_key} saved ({len(token_json)} bytes) — "
+          f"set this as a Render env var to persist across redeploys")
+
+def _load_token(env_key, file_path):
+    """Read token from os.environ first, then file fallback. Caches file value into os.environ."""
+    val = os.environ.get(env_key, "")
+    if val:
+        return val
+    if os.path.exists(file_path):
+        try:
+            with open(file_path) as f:
+                token_json = f.read().strip()
+            if token_json:
+                os.environ[env_key] = token_json  # promote to env for faster future reads
+                return token_json
+        except Exception:
+            pass
+    return ""
+
+def _clear_token(env_key, file_path):
+    """Remove token from os.environ and delete file."""
+    os.environ.pop(env_key, None)
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
+# ── Google Calendar helpers ──
 def get_gcal_creds():
-    path = gcal_token_path()
-    if not os.path.exists(path):
+    token_json = _load_token("GCAL_TOKEN", "gcal_token.json")
+    if not token_json:
         return None
-    creds = Credentials.from_authorized_user_file(path, GCAL_SCOPES)
+    try:
+        creds = Credentials.from_authorized_user_info(json.loads(token_json), GCAL_SCOPES)
+    except Exception as e:
+        print(f"[GCAL CREDS] parse error: {e}")
+        return None
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(GRequest())
-            with open(path, "w") as f:
-                f.write(creds.to_json())
+            _save_token("GCAL_TOKEN", creds.to_json())
         except Exception as e:
-            print(f"Token refresh error: {e}")
+            print(f"[GCAL CREDS] refresh error: {e}")
             return None
     return creds if (creds and creds.valid) else None
 
@@ -546,6 +590,8 @@ def gcal_callback():
     token_data = token_resp.json()
     if "error" in token_data:
         return f"<h2>Token exchange error: {token_data.get('error_description', token_data.get('error'))}</h2>", 400
+    from datetime import timezone
+    expiry = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(seconds=int(token_data.get("expires_in", 3600)))
     creds = Credentials(
         token=token_data["access_token"],
         refresh_token=token_data.get("refresh_token"),
@@ -553,9 +599,9 @@ def gcal_callback():
         client_id=GOOGLE_CLIENT_ID,
         client_secret=GOOGLE_CLIENT_SECRET,
         scopes=GCAL_SCOPES,
+        expiry=expiry,
     )
-    with open(gcal_token_path(), "w") as f:
-        f.write(creds.to_json())
+    _save_token("GCAL_TOKEN", creds.to_json())
     return """<html><body style='background:#000;color:#fff;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:16px;'>
     <div style='font-size:48px;'>✓</div>
     <div style='font-size:20px;font-weight:600;'>Google Calendar Connected</div>
@@ -666,40 +712,27 @@ def gcal_delete():
 
 @app.route("/gcal/disconnect", methods=["POST"])
 def gcal_disconnect():
-    path = gcal_token_path()
-    if os.path.exists(path):
-        os.remove(path)
+    _clear_token("GCAL_TOKEN", "gcal_token.json")
     return jsonify({"disconnected": True})
 
 # ── Gmail helpers ──
-def gmail_token_path():
-    return "gmail_token.json"
-
 def get_gmail_creds():
-    path = gmail_token_path()
-    abs_path = os.path.abspath(path)
-    exists = os.path.exists(path)
-    print(f"[GMAIL CREDS] path={abs_path} exists={exists}")
-    if not exists:
+    token_json = _load_token("GMAIL_TOKEN", "gmail_token.json")
+    if not token_json:
         return None
     try:
-        creds = Credentials.from_authorized_user_file(path, GMAIL_SCOPES)
-        print(f"[GMAIL CREDS] token_present={bool(creds.token)} expired={creds.expired} expiry={creds.expiry} valid={creds.valid}")
+        creds = Credentials.from_authorized_user_info(json.loads(token_json), GMAIL_SCOPES)
     except Exception as e:
-        print(f"[GMAIL CREDS] from_authorized_user_file error: {e}")
+        print(f"[GMAIL CREDS] parse error: {e}")
         return None
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(GRequest())
-            with open(path, "w") as f:
-                f.write(creds.to_json())
-            print(f"[GMAIL CREDS] token refreshed ok")
+            _save_token("GMAIL_TOKEN", creds.to_json())
         except Exception as e:
             print(f"[GMAIL CREDS] refresh error: {e}")
             return None
-    result = creds if (creds and creds.valid) else None
-    print(f"[GMAIL CREDS] returning={'valid creds' if result else 'None (creds.valid was False)'}")
-    return result
+    return creds if (creds and creds.valid) else None
 
 def get_gmail_service():
     creds = get_gmail_creds()
@@ -740,9 +773,7 @@ def gmail_callback():
         },
     )
     token_data = token_resp.json()
-    print(f"[GMAIL CALLBACK] token exchange keys: {list(token_data.keys())}")
     if "error" in token_data:
-        print(f"[GMAIL CALLBACK] token exchange error: {token_data}")
         return f"<h2>Token exchange error: {token_data.get('error_description', token_data.get('error'))}</h2>", 400
     from datetime import timezone
     expiry = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(seconds=int(token_data.get("expires_in", 3600)))
@@ -755,11 +786,7 @@ def gmail_callback():
         scopes=GMAIL_SCOPES,
         expiry=expiry,
     )
-    print(f"[GMAIL CALLBACK] creds.valid={creds.valid} creds.expired={creds.expired} expiry={creds.expiry}")
-    token_file = gmail_token_path()
-    with open(token_file, "w") as f:
-        f.write(creds.to_json())
-    print(f"[GMAIL CALLBACK] saved token to {os.path.abspath(token_file)}, size={os.path.getsize(token_file)} bytes")
+    _save_token("GMAIL_TOKEN", creds.to_json())
     return """<html><head><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#0a0a0a;color:#fff;}
     .card{text-align:center;padding:40px;background:#1a1a1a;border-radius:16px;border:1px solid #333;}
     h2{color:#4ade80;margin:0 0 12px;}p{color:#999;margin:0;}</style></head>
@@ -767,20 +794,14 @@ def gmail_callback():
 
 @app.route("/gmail/status")
 def gmail_status():
-    print("[GMAIL STATUS] request received")
     creds = get_gmail_creds()
     if not creds:
-        print("[GMAIL STATUS] returning connected=false (no valid creds)")
         return jsonify({"connected": False})
-    print("[GMAIL STATUS] valid creds found — returning connected=true")
     try:
         svc = get_gmail_service()
         profile = svc.users().getProfile(userId="me").execute()
-        email = profile.get("emailAddress", "")
-        print(f"[GMAIL STATUS] profile fetch ok, email={email}")
-        return jsonify({"connected": True, "email": email})
-    except Exception as e:
-        print(f"[GMAIL STATUS] profile fetch failed ({e}) — still connected")
+        return jsonify({"connected": True, "email": profile.get("emailAddress", "")})
+    except Exception:
         return jsonify({"connected": True, "email": ""})
 
 @app.route("/gmail/inbox")
@@ -872,9 +893,7 @@ def gmail_send():
 
 @app.route("/gmail/disconnect", methods=["POST"])
 def gmail_disconnect():
-    path = gmail_token_path()
-    if os.path.exists(path):
-        os.remove(path)
+    _clear_token("GMAIL_TOKEN", "gmail_token.json")
     return jsonify({"disconnected": True})
 
 if __name__ == "__main__":
