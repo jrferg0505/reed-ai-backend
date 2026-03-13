@@ -359,5 +359,75 @@ def agent_log_spend():
 def agent_spend_history():
     return jsonify(load_json("daily_personal_spend.json", {"entries": []}))
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+# ── WhatsApp two-way chat ──
+# Incoming messages from Twilio webhook are stored here
+# Frontend polls /wa-messages and sends via /wa-send
+
+@app.route("/wa-webhook", methods=["POST"])
+def wa_webhook():
+    """Twilio sends incoming WhatsApp messages here."""
+    import uuid
+    from_num = request.form.get("From", "")
+    body     = request.form.get("Body", "").strip()
+    if not body:
+        return ("", 204)
+    msgs = load_json("wa_inbox.json", [])
+    msg = {
+        "id":   str(uuid.uuid4()),
+        "from": from_num,
+        "body": body,
+        "ts":   int(datetime.now().timestamp() * 1000)
+    }
+    msgs.append(msg)
+    # keep last 500
+    if len(msgs) > 500:
+        msgs = msgs[-500:]
+    save_json("wa_inbox.json", msgs)
+    print(f"WA in from {from_num}: {body[:60]}")
+    return ("", 204)
+
+@app.route("/wa-messages")
+def wa_messages():
+    """Return messages newer than `since` (a message id string).
+    If since is empty, returns last 50 messages."""
+    since_id = request.args.get("since", "")
+    msgs = load_json("wa_inbox.json", [])
+    if since_id:
+        # find index of last known id and return everything after
+        idx = next((i for i,m in enumerate(msgs) if m["id"]==since_id), None)
+        if idx is not None:
+            msgs = msgs[idx+1:]
+        else:
+            msgs = msgs[-50:]
+    else:
+        msgs = msgs[-50:]
+    return jsonify({"messages": msgs})
+
+@app.route("/wa-send", methods=["POST"])
+def wa_send():
+    """Send a WhatsApp message to Reed's phone (or a specified number)."""
+    data    = request.get_json() or {}
+    body    = data.get("message", "").strip()
+    to_num  = data.get("to", "").strip() or REED_PHONE
+    if not body:
+        return jsonify({"error": "No message"}), 400
+    try:
+        # ensure +1 format
+        if not to_num.startswith("+"):
+            to_num = "+" + to_num.replace(" ", "")
+        Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
+            body=body,
+            from_="whatsapp:" + TWILIO_FROM,
+            to="whatsapp:" + to_num
+        )
+        return jsonify({"sent": True})
+    except Exception as e:
+        print(f"WA send error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
