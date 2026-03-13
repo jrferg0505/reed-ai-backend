@@ -247,6 +247,41 @@ print(f"Scheduler started. Morning briefing at {BRIEFING_HOUR}:00 {TIMEZONE}")
 @app.route("/")
 def index(): return jsonify({"status": "Reed AI Backend Running", "time": datetime.now().isoformat()})
 
+@app.route("/chat", methods=["POST"])
+def chat():
+    try:
+        data = request.json
+        messages = data.get("messages", [])
+        system = data.get("system", "")
+        use_search = data.get("use_search", False)
+        model = data.get("model", "claude-haiku-4-5-20251001")
+        max_tokens = data.get("max_tokens", 512)
+        headers = {
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        body = {"model": model, "max_tokens": max_tokens, "messages": messages}
+        if system: body["system"] = system
+        if use_search:
+            headers["anthropic-beta"] = "web-search-2025-03-05"
+            body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]
+        r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+        result = r.json()
+        if result.get("error"): return jsonify({"error": result["error"]["message"]}), 400
+        # Handle tool use (web search)
+        if result.get("stop_reason") == "tool_use" and use_search:
+            r2 = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+                "model": model, "max_tokens": max_tokens, "system": system if system else "",
+                "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+                "messages": messages + [{"role": "assistant", "content": result["content"]}]
+            })
+            result = r2.json()
+            if result.get("error"): return jsonify({"error": result["error"]["message"]}), 400
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/ping")
 def ping(): return jsonify({"ok": True})
 
