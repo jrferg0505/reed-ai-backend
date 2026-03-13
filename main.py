@@ -256,8 +256,12 @@ def chat():
         use_search = data.get("use_search", False)
         model = data.get("model", "claude-haiku-4-5-20251001")
         max_tokens = data.get("max_tokens", 512)
+        # Accept key from frontend if env var missing
+        api_key = ANTHROPIC_KEY or data.get("api_key", "")
+        if not api_key:
+            return jsonify({"error": "No API key configured"}), 400
         headers = {
-            "x-api-key": ANTHROPIC_KEY,
+            "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json"
         }
