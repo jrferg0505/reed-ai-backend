@@ -23,7 +23,10 @@ BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "8"))
 GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI", "https://reed-ai-backend.onrender.com/gcal/callback")
-GCAL_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+GCAL_SCOPES = [
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+]
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 
 def load_json(path, default):
@@ -515,6 +518,7 @@ def gcal_auth():
         scopes=GCAL_SCOPES,
         redirect_uri=GOOGLE_REDIRECT_URI
     )
+    flow.code_verifier = None  # disable PKCE — server-side flow doesn't need it
     auth_url, _ = flow.authorization_url(
         access_type="offline", include_granted_scopes="true", prompt="consent"
     )
@@ -537,6 +541,7 @@ def gcal_callback():
         scopes=GCAL_SCOPES,
         redirect_uri=GOOGLE_REDIRECT_URI
     )
+    flow.code_verifier = None  # PKCE disabled — must match auth step
     flow.fetch_token(code=code)
     creds = flow.credentials
     with open(gcal_token_path(), "w") as f:
