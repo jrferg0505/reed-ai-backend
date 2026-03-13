@@ -279,8 +279,7 @@ def _save_token(env_key, token_json):
             f.write(token_json)
     except Exception:
         pass
-    print(f"[TOKEN] {env_key} saved ({len(token_json)} bytes) — "
-          f"set this as a Render env var to persist across redeploys")
+    print(f"[TOKEN] {env_key} = {token_json}")
 
 def _load_token(env_key, file_path):
     """Read token from os.environ first, then file fallback. Caches file value into os.environ."""
