@@ -239,21 +239,103 @@ def ask_claude(prompt, use_search=False, max_tokens=1024):
     except: pass
     return text.strip()
 
-def morning_briefing():
-    print("Running morning briefing...")
+def build_daily_briefing():
+    """Build a personalized daily briefing string from live data (weather, calendar, email)."""
     try:
+        today_str = datetime.now().strftime("%A, %B %-d")
+
+        # 1. Weather via wttr.in — no API key needed
+        try:
+            weather_raw = requests.get(
+                "https://wttr.in/Indianapolis?format=3", timeout=5
+            ).text.strip()
+            weather_line = f"☀️ {weather_raw}"
+        except Exception:
+            weather_line = "☀️ Weather unavailable right now"
+
+        # 2. Google Calendar events today
         cal_text = gcal_events_text(days=1)
-        cal_section = f"\n📅 Today's Schedule:\n{cal_text}" if cal_text and cal_text != "No upcoming events." else ""
-        text = ask_claude("""Search for Indianapolis weather today. Give Reed his morning briefing.
-Format (under 400 chars, use line breaks):
-Good Morning Reed 🌅
-☀️ Weather: [Indianapolis weather today — temp + conditions]
-💬 [One punchy motivational quote]
-🎯 Focus: [One specific action toward his goals]
-💼 Job Tip: [One quick job search tip]
-Reed: hunting $18+/hr office job Indianapolis, saving for car, learning AI. Capitalize Every Word.""", use_search=True)
+        if cal_text and cal_text.strip() and cal_text.strip() != "No upcoming events.":
+            cal_section = "📅 Today's Schedule:\n" + cal_text.strip()
+        else:
+            cal_section = "📅 Nothing on the calendar today"
+
+        # 3. Important emails from the last 24 hours
+        email_section = ""
+        try:
+            svc = get_gmail_service()
+            if svc:
+                after_date = (datetime.now() - timedelta(hours=24)).strftime("%Y/%m/%d")
+                query = (
+                    f"after:{after_date} label:important "
+                    "(subject:interview OR subject:offer OR subject:urgent "
+                    "OR subject:invoice OR subject:recruiter OR subject:application)"
+                )
+                result = svc.users().messages().list(
+                    userId="me", q=query, maxResults=5
+                ).execute()
+                msgs_found = result.get("messages", [])
+                if msgs_found:
+                    lines = []
+                    for m in msgs_found[:3]:
+                        hdrs = (
+                            svc.users().messages().get(
+                                userId="me", id=m["id"],
+                                format="metadata",
+                                metadataHeaders=["Subject", "From"],
+                            )
+                            .execute()
+                            .get("payload", {})
+                            .get("headers", [])
+                        )
+                        subj = next(
+                            (h["value"] for h in hdrs if h["name"] == "Subject"),
+                            "No Subject",
+                        )[:55]
+                        sender = next(
+                            (h["value"] for h in hdrs if h["name"] == "From"),
+                            "",
+                        )
+                        sender_name = re.sub(r'\s*<[^>]+>', '', sender).strip()[:30]
+                        lines.append(f"  • {subj} — {sender_name}")
+                    email_section = "📬 Important Emails:\n" + "\n".join(lines)
+        except Exception as exc:
+            print(f"Briefing email scan error: {exc}")
+
+        # 4. Short motivational line via Claude
+        try:
+            motivation = ask_claude(
+                "One short motivational line for Reed (Indianapolis, hunting office job, saving for a car). "
+                "Under 80 chars. No quotes or attribution. Just the line.",
+                use_search=False,
+            ).strip()
+        except Exception:
+            motivation = "Keep going — every step forward counts."
+
+        # 5. Assemble
+        parts = [
+            f"Good Morning Reed 🌅 — {today_str}",
+            weather_line,
+            cal_section,
+        ]
+        if email_section:
+            parts.append(email_section)
+        parts.append(f"💪 {motivation}")
+
+        return "\n\n".join(parts)
+
+    except Exception as e:
+        print(f"build_daily_briefing error: {e}")
+        return "Good morning Reed! 🌅 Couldn't pull your briefing right now — try again in a bit."
+
+
+def morning_briefing():
+    """Send on-demand daily briefing via WhatsApp (also called by /agent/briefing route)."""
+    print("Sending daily briefing...")
+    try:
+        text = build_daily_briefing()
         send_whatsapp(text)
-        print("Morning briefing sent.")
+        print("Daily briefing sent.")
     except Exception as e:
         print(f"Morning briefing error: {e}")
 
@@ -408,7 +490,6 @@ def run_agent_task(task_type, custom_prompt=None):
 
 # ── SCHEDULER ──
 scheduler = BackgroundScheduler(timezone=TIMEZONE)
-scheduler.add_job(morning_briefing,    CronTrigger(hour=BRIEFING_HOUR, minute=0, timezone=TIMEZONE),        id="morning_briefing",    replace_existing=True)
 scheduler.add_job(job_scan,            CronTrigger(hour=9, minute=0, timezone=TIMEZONE),                    id="job_scan",            replace_existing=True)
 scheduler.add_job(evening_news,        CronTrigger(hour=19, minute=0, timezone=TIMEZONE),                   id="evening_news",        replace_existing=True)
 scheduler.add_job(mood_checkin,        CronTrigger(hour=21, minute=30, timezone=TIMEZONE),                  id="mood_checkin",        replace_existing=True)
@@ -419,7 +500,7 @@ scheduler.add_job(weekly_spend_report, CronTrigger(day_of_week="tue", hour=16, m
 scheduler.add_job(daily_spend_report,  CronTrigger(hour=21, minute=0, timezone=TIMEZONE),                   id="daily_spend_report",  replace_existing=True)
 scheduler.add_job(keep_alive,          "interval", minutes=5,                                               id="keep_alive",          replace_existing=True)
 scheduler.start()
-print(f"Scheduler started. Morning briefing at {BRIEFING_HOUR}:00 {TIMEZONE}")
+print(f"Scheduler started ({TIMEZONE}). On-demand briefing active.")
 
 # ── ROUTES ──
 # ── Persistent token store ──
@@ -572,7 +653,6 @@ def test_sms():
 @app.route("/agent/status")
 def agent_status():
     return jsonify({"online": True, "scheduler": scheduler.state == STATE_RUNNING,
-        "next_briefing": str(scheduler.get_job("morning_briefing").next_run_time),
         "next_job_scan": str(scheduler.get_job("job_scan").next_run_time)})
 
 @app.route("/agent/spend")
@@ -755,6 +835,22 @@ def wa_webhook():
                             "waiting_for": "message_body",
                         }
                         reply_text = f"What do you want to say to {to_name}?"
+
+            # ── Path B.5: on-demand daily briefing ───────────────────────────
+            if reply_text is None:
+                _BRIEFING_RE = re.compile(
+                    r'^\s*('
+                    r'good\s+morning|gm[!.]*|'
+                    r'morning\s+briefing|daily\s+briefing|'
+                    r'what.{0,10}my\s+day|'
+                    r'day\s+look.{0,15}like|'
+                    r'what.{0,10}today|'
+                    r'briefing'
+                    r')\s*[?!.]*\s*$',
+                    re.IGNORECASE,
+                )
+                if _BRIEFING_RE.match(body):
+                    reply_text = build_daily_briefing()
 
             # ── Path C: regular AI conversation ──────────────────────────────
             if reply_text is None:
