@@ -75,12 +75,82 @@ def _wa_send_email(to_addr, subject, body_text):
         return False, str(e)
 
 def _wa_parse_email_intent(text):
-    """Use Claude Haiku to detect & parse an email-send intent from a WhatsApp message.
-    Returns a dict with parsed fields if it IS an email intent, otherwise None."""
-    # Pre-filter: skip obvious non-email messages to save an API call
-    if not re.search(r'\b(email|e-mail|send\s+(an?\s+)?email|write\s+to|message\s+to)\b',
-                     text, re.IGNORECASE):
+    """Detect and parse an email-send intent from a WhatsApp message.
+
+    Strategy (no single point of failure):
+      1. Keyword pre-filter — bail fast if no email trigger word.
+      2. Regex fast-path — extract address + body directly from text.
+         Returns immediately if we have everything; no API call needed.
+      3. Claude fallback — only called when info is genuinely missing
+         (e.g. recipient is a name, not an address).  If the API call
+         fails for any reason we fall back to whatever regex found.
+
+    Returns a dict compatible with Path B in _auto_reply, or None.
+    """
+    # ── 1. Pre-filter ──────────────────────────────────────────────────────
+    if not re.search(
+        r'\b(email|e-mail|send\s+(an?\s+)?email|write\s+to|message\s+to)\b',
+        text, re.IGNORECASE
+    ):
         return None
+
+    # ── 2. Regex fast-path ─────────────────────────────────────────────────
+    # Extract email address if present
+    addr_m = re.search(r'[\w.+\-]+@[\w\-]+\.[a-zA-Z]{2,}', text)
+    to_email_regex = addr_m.group() if addr_m else None
+
+    # Extract body: everything after keywords like "saying", "tell X that", etc.
+    body_regex = None
+    body_m = re.search(
+        r'\b(?:saying|say(?:ing)?|tell\s+\w+(?:\s+that)?|that\s+(?=\S))\s+(.+)$',
+        text, re.IGNORECASE | re.DOTALL
+    )
+    if body_m:
+        body_regex = body_m.group(1).strip()
+    else:
+        # Fallback: everything after the email address (minus connector words)
+        if to_email_regex:
+            after = text[text.find(to_email_regex) + len(to_email_regex):].strip()
+            after = re.sub(r'^(?:and\s+)?(?:to\s+)?(?:say|tell\s+\w+)\s*', '', after,
+                           flags=re.IGNORECASE).strip()
+            # "about X" is a topic — need to ask for the actual message
+            if after and not re.match(r'^about\b', after, re.IGNORECASE):
+                body_regex = after
+
+    # Build subject from first ~60 chars of body, or a generic fallback
+    def _make_subject(b):
+        if not b:
+            return "Message from Reed"
+        s = b.strip().rstrip('.!?')
+        return (s[:57] + "...") if len(s) > 60 else s
+
+    # If regex gave us both address and body → return immediately (no API call)
+    if to_email_regex and body_regex:
+        result = {
+            "is_email": True,
+            "to_email": to_email_regex,
+            "to_name":  None,
+            "subject":  _make_subject(body_regex),
+            "body":     body_regex,
+            "missing":  "none",
+        }
+        print(f"[WA EMAIL PARSE] fast-path: {result}")
+        return result
+
+    # If regex gave address but no body → store partial and skip Claude
+    if to_email_regex and not body_regex:
+        result = {
+            "is_email": True,
+            "to_email": to_email_regex,
+            "to_name":  None,
+            "subject":  "Message from Reed",
+            "body":     None,
+            "missing":  "message_body",
+        }
+        print(f"[WA EMAIL PARSE] fast-path (need body): {result}")
+        return result
+
+    # ── 3. Claude fallback (name-only recipient or ambiguous) ──────────────
     try:
         r = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -93,44 +163,52 @@ def _wa_parse_email_intent(text):
                 "model": "claude-haiku-4-5-20251001",
                 "max_tokens": 300,
                 "system": (
-                    "You extract email-send intent from messages. "
-                    "You MUST reply with ONLY a raw JSON object — no markdown, "
-                    "no code fences, no explanation, just the JSON."
+                    "Extract email-send intent. "
+                    "Reply with ONLY a raw JSON object — no markdown, no fences."
                 ),
                 "messages": [{"role": "user", "content":
-                    f'Message: "{text}"\n\n'
-                    'Respond with ONLY this JSON (no markdown fences):\n'
-                    '{"is_email":true/false,"to_email":"addr or null","to_name":"name or null",'
-                    '"subject":"subject or null","body":"full email body or null",'
-                    '"missing":"none|email_address|message_body|both"}\n\n'
-                    'is_email=true only if the user is explicitly asking to send an email.\n'
-                    'body=null if the topic is too vague to write the email text.\n'
-                    'missing=the field(s) still needed before the email can be sent.'
+                    f'Message: "{text}"\n'
+                    'JSON only: {"is_email":true/false,"to_email":"addr or null",'
+                    '"to_name":"name or null","subject":"subject or null",'
+                    '"body":"email body or null","missing":"none|email_address|message_body|both"}'
                 }],
             },
             timeout=12,
         )
+        resp_data = r.json()
         raw_out = "".join(
-            b["text"] for b in r.json().get("content", []) if b.get("type") == "text"
+            b["text"] for b in resp_data.get("content", []) if b.get("type") == "text"
         ).strip()
-        print(f"[WA EMAIL PARSE] raw response: {raw_out[:300]}")
+        print(f"[WA EMAIL PARSE] Claude raw: {raw_out[:300]}")
 
-        # Strip markdown code fences if Claude added them anyway
-        cleaned = re.sub(r'^```(?:json)?\s*', '', raw_out, flags=re.MULTILINE)
-        cleaned = re.sub(r'\s*```\s*$', '', cleaned, flags=re.MULTILINE).strip()
-
-        # Extract the JSON object even if there is surrounding prose
-        m = re.search(r'\{.*\}', cleaned, re.DOTALL)
-        if not m:
-            print(f"[WA EMAIL PARSE] no JSON object found in response")
-            return None
-
-        parsed = json.loads(m.group())
-        print(f"[WA EMAIL PARSE] parsed: {parsed}")
-        return parsed if parsed.get("is_email") else None
+        cleaned = re.sub(r'^```(?:json)?\s*|\s*```\s*$', '', raw_out).strip()
+        json_m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        if json_m:
+            parsed = json.loads(json_m.group())
+            print(f"[WA EMAIL PARSE] Claude parsed: {parsed}")
+            if parsed.get("is_email"):
+                return parsed
     except Exception as e:
-        print(f"[WA EMAIL PARSE] error: {e}")
-        return None
+        print(f"[WA EMAIL PARSE] Claude error (using regex fallback): {e}")
+
+    # If Claude failed but we at least know it's an email intent (pre-filter passed
+    # and text contained "email"), return a minimal result so Path B handles it.
+    if to_email_regex:
+        return {
+            "is_email": True, "to_email": to_email_regex, "to_name": None,
+            "subject": "Message from Reed", "body": None, "missing": "message_body",
+        }
+    # Couldn't extract enough — let the regex say "need email address"
+    name_m = re.search(
+        r'\bemail\s+(\w+)(?:\s+about|\s+saying|\s+to\s+say)?', text, re.IGNORECASE
+    )
+    if name_m:
+        return {
+            "is_email": True, "to_email": None,
+            "to_name": name_m.group(1).capitalize(),
+            "subject": None, "body": None, "missing": "email_address",
+        }
+    return None
 
 def ask_claude(prompt, use_search=False, max_tokens=1024):
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
