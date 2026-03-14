@@ -35,6 +35,10 @@ GMAIL_SCOPES = [
 ]
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 
+# In-memory store for pending email drafts triggered via WhatsApp
+# { from_num: { "to_name", "to_email", "subject", "body", "waiting_for" } }
+wa_pending_emails = {}
+
 def load_json(path, default):
     try:
         with open(path) as f: return json.load(f)
@@ -50,6 +54,69 @@ def send_whatsapp(body):
         print(f"WhatsApp sent: {body[:60]}...")
     except Exception as e:
         print(f"WhatsApp error: {e}")
+
+def _wa_send_email(to_addr, subject, body_text):
+    """Send an email via the stored Gmail credentials.
+    Returns (True, None) on success or (False, error_string) on failure."""
+    try:
+        svc = get_gmail_service()
+        if not svc:
+            return False, "Gmail not connected — connect it in the Onyx app first"
+        mime_msg = MIMEText(body_text)
+        mime_msg["to"]      = to_addr
+        mime_msg["subject"] = subject
+        raw = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
+        svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def _wa_parse_email_intent(text):
+    """Use Claude Haiku to detect & parse an email-send intent from a WhatsApp message.
+    Returns a dict with parsed fields if it IS an email intent, otherwise None."""
+    # Pre-filter: skip obvious non-email messages to save API calls
+    if not re.search(r'\b(email|e-mail|send\s+a\s+message|write\s+to|message\s+to)\b',
+                     text, re.IGNORECASE):
+        return None
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 280,
+                "system": "Extract email-send intent. Reply ONLY with valid JSON, no other text.",
+                "messages": [{"role": "user", "content":
+                    f'Analyze: "{text}"\n\n'
+                    'Return JSON:\n'
+                    '{\n'
+                    '  "is_email": true/false,\n'
+                    '  "to_email": "addr@example.com or null",\n'
+                    '  "to_name": "Recipient name or null",\n'
+                    '  "subject": "Short subject line or null",\n'
+                    '  "body": "Full composed email body, or null if insufficient detail",\n'
+                    '  "missing": "none" | "email_address" | "message_body" | "both"\n'
+                    '}\n\n'
+                    'Rules:\n'
+                    '- is_email=true only if explicitly asking to send/compose/write an email\n'
+                    '- body=null if only a vague topic was given (not enough to write the email)\n'
+                    '- missing reflects what info is still needed to actually send the email'
+                }],
+            },
+            timeout=12,
+        )
+        out = "".join(
+            b["text"] for b in r.json().get("content", []) if b.get("type") == "text"
+        ).strip()
+        parsed = json.loads(out)
+        return parsed if parsed.get("is_email") else None
+    except Exception as e:
+        print(f"[WA EMAIL PARSE] error: {e}")
+        return None
 
 def ask_claude(prompt, use_search=False, max_tokens=1024):
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
@@ -516,63 +583,140 @@ def wa_webhook():
     # 2. Generate AI reply in a background thread (don't block Twilio's 15s window)
     def _auto_reply(snapshot):
         try:
-            # Build alternating user/assistant context from recent conversation
-            context = []
-            for m in snapshot[-20:]:
-                role = "user" if m.get("dir") == "in" else "assistant"
-                if context and context[-1]["role"] == role:
-                    # merge consecutive same-role messages
-                    context[-1]["content"] += "\n" + m["body"]
-                else:
-                    context.append({"role": role, "content": m["body"]})
-            # Anthropic requires conversation to start with 'user'
-            while context and context[0]["role"] == "assistant":
-                context.pop(0)
-            if not context:
-                context = [{"role": "user", "content": body}]
+            reply_text = None
 
-            sys_prompt = (
-                "You are Onyx, Reed's personal AI assistant, responding via WhatsApp. "
-                "Reed Ferguson, Indianapolis, works at a donut shop, hunting for an office job "
-                "($18+/hr, no degree, 9-5 M-F), saving for a car, learning AI. "
-                "Be direct, conversational, and concise (1-3 sentences unless detail is needed). "
-                "Smart friend tone — no filler phrases, no 'certainly' or 'of course'."
-            )
-            headers = {
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            }
-            r = requests.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json={
-                    "model": "claude-haiku-4-5-20251001",
-                    "max_tokens": 350,
-                    "system": sys_prompt,
-                    "messages": context,
-                },
-                timeout=25,
-            )
-            data = r.json()
-            if data.get("error"):
-                print(f"WA AI error: {data['error']}")
-                return
-            reply_text = "".join(
-                b["text"] for b in data.get("content", []) if b.get("type") == "text"
-            ).strip()
+            # ── Path A: pending email clarification ──────────────────────────
+            pending = wa_pending_emails.get(from_num)
+            if pending:
+                # Let Reed cancel mid-flow
+                if re.match(r'^\s*(cancel|nevermind|never\s+mind|forget\s+it|stop|nope)\s*$',
+                            body, re.IGNORECASE):
+                    del wa_pending_emails[from_num]
+                    reply_text = "Got it — email cancelled."
+
+                elif pending["waiting_for"] == "email_address":
+                    addr_match = re.search(r'[\w.+\-]+@[\w\-]+\.[a-zA-Z]{2,}', body)
+                    if addr_match:
+                        pending["to_email"] = addr_match.group()
+                        if pending.get("body"):
+                            # Have everything now — send
+                            del wa_pending_emails[from_num]
+                            ok, err = _wa_send_email(
+                                pending["to_email"],
+                                pending.get("subject", "Message from Reed"),
+                                pending["body"],
+                            )
+                            reply_text = (f"Done — email sent to {pending['to_email']} ✓"
+                                          if ok else f"Couldn't send the email: {err}")
+                        else:
+                            # Still need the body
+                            pending["waiting_for"] = "message_body"
+                            name = pending.get("to_name") or pending["to_email"]
+                            reply_text = f"Got it. What do you want to say to {name}?"
+                    else:
+                        reply_text = ("That doesn't look like a valid email address. "
+                                      "Try: name@example.com")
+
+                elif pending["waiting_for"] == "message_body":
+                    to_email = pending["to_email"]
+                    subject  = pending.get("subject") or "Message from Reed"
+                    del wa_pending_emails[from_num]
+                    ok, err = _wa_send_email(to_email, subject, body)
+                    label = pending.get("to_name") or to_email
+                    reply_text = (f"Done — email sent to {label} ✓"
+                                  if ok else f"Couldn't send the email: {err}")
+
+            # ── Path B: fresh email intent ────────────────────────────────────
+            if reply_text is None:
+                intent = _wa_parse_email_intent(body)
+                if intent:
+                    to_email  = intent.get("to_email")
+                    to_name   = intent.get("to_name") or to_email or "them"
+                    subject   = intent.get("subject") or "Message from Reed"
+                    body_text = intent.get("body")
+                    missing   = intent.get("missing", "none")
+
+                    if missing == "none" and to_email and body_text:
+                        # Send immediately
+                        ok, err = _wa_send_email(to_email, subject, body_text)
+                        reply_text = (f"Done — email sent to {to_email} ✓"
+                                      if ok else f"Couldn't send the email: {err}")
+
+                    elif not to_email or missing in ("email_address", "both"):
+                        # Need email address first
+                        wa_pending_emails[from_num] = {
+                            "to_name": to_name,
+                            "to_email": to_email,
+                            "subject":  subject,
+                            "body":     body_text,
+                            "waiting_for": "email_address",
+                        }
+                        reply_text = f"What's {to_name}'s email address?"
+
+                    else:
+                        # Have address but need the body
+                        wa_pending_emails[from_num] = {
+                            "to_name": to_name,
+                            "to_email": to_email,
+                            "subject":  subject,
+                            "body":     None,
+                            "waiting_for": "message_body",
+                        }
+                        reply_text = f"What do you want to say to {to_name}?"
+
+            # ── Path C: regular AI conversation ──────────────────────────────
+            if reply_text is None:
+                context = []
+                for m in snapshot[-20:]:
+                    role = "user" if m.get("dir") == "in" else "assistant"
+                    if context and context[-1]["role"] == role:
+                        context[-1]["content"] += "\n" + m["body"]
+                    else:
+                        context.append({"role": role, "content": m["body"]})
+                while context and context[0]["role"] == "assistant":
+                    context.pop(0)
+                if not context:
+                    context = [{"role": "user", "content": body}]
+
+                r = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": ANTHROPIC_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": "claude-haiku-4-5-20251001",
+                        "max_tokens": 350,
+                        "system": (
+                            "You are Onyx, Reed's personal AI assistant, responding via WhatsApp. "
+                            "Reed Ferguson, Indianapolis, works at a donut shop, hunting for an office job "
+                            "($18+/hr, no degree, 9-5 M-F), saving for a car, learning AI. "
+                            "Be direct, conversational, and concise (1-3 sentences unless detail is needed). "
+                            "Smart friend tone — no filler phrases, no 'certainly' or 'of course'."
+                        ),
+                        "messages": context,
+                    },
+                    timeout=25,
+                )
+                data = r.json()
+                if data.get("error"):
+                    print(f"WA AI error: {data['error']}")
+                    return
+                reply_text = "".join(
+                    b["text"] for b in data.get("content", []) if b.get("type") == "text"
+                ).strip()
+
             if not reply_text:
                 return
 
-            # 3. Send reply back to Reed via Twilio
+            # ── Send reply via Twilio + store for Onyx UI ────────────────────
             to_wa = from_num if from_num.startswith("whatsapp:") else "whatsapp:" + from_num
             Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
                 body=reply_text,
                 from_="whatsapp:" + TWILIO_FROM,
                 to=to_wa,
             )
-
-            # 4. Store AI reply so the Onyx UI poll picks it up (dir='out')
             all_msgs = load_json("wa_inbox.json", [])
             all_msgs.append({
                 "id":   str(_uuid.uuid4()),
@@ -584,7 +728,7 @@ def wa_webhook():
             if len(all_msgs) > 500:
                 all_msgs = all_msgs[-500:]
             save_json("wa_inbox.json", all_msgs)
-            print(f"WA AI reply sent: {reply_text[:80]}")
+            print(f"WA reply sent: {reply_text[:80]}")
         except Exception as e:
             print(f"WA auto-reply error: {e}")
 
