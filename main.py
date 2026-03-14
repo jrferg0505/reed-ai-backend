@@ -805,32 +805,39 @@ def gmail_status():
 
 @app.route("/gmail/inbox")
 def gmail_inbox():
-    """Return recent unread emails."""
+    """Return recent inbox emails (read + unread)."""
     try:
         svc = get_gmail_service()
         if not svc:
             return jsonify({"error": "not_connected"}), 401
-        max_results = int(request.args.get("max", 10))
+        max_results = int(request.args.get("max", 15))
         result = svc.users().messages().list(
-            userId="me", labelIds=["INBOX", "UNREAD"], maxResults=max_results
+            userId="me", labelIds=["INBOX"], maxResults=max_results
         ).execute()
         msgs = result.get("messages", [])
         emails = []
         for m in msgs:
-            msg = svc.users().messages().get(userId="me", id=m["id"], format="metadata",
-                metadataHeaders=["Subject","From","Date"]).execute()
-            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-            snippet = msg.get("snippet", "")
-            emails.append({
-                "id": m["id"],
-                "threadId": msg.get("threadId", ""),
-                "subject": headers.get("Subject", "(no subject)"),
-                "from": headers.get("From", ""),
-                "date": headers.get("Date", ""),
-                "snippet": snippet,
-            })
+            try:
+                msg = svc.users().messages().get(
+                    userId="me", id=m["id"], format="metadata",
+                    metadataHeaders=["Subject", "From", "Date"]
+                ).execute()
+                headers = {h["name"]: h["value"]
+                           for h in msg.get("payload", {}).get("headers", [])}
+                emails.append({
+                    "id": m["id"],
+                    "threadId": msg.get("threadId", ""),
+                    "subject": headers.get("Subject", "(no subject)"),
+                    "from": headers.get("From", ""),
+                    "date": headers.get("Date", ""),
+                    "snippet": msg.get("snippet", ""),
+                })
+            except Exception as inner:
+                print(f"[GMAIL INBOX] skipping message {m['id']}: {inner}")
+                continue
         return jsonify({"emails": emails})
     except Exception as e:
+        print(f"[GMAIL INBOX] error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/gmail/important")
@@ -849,19 +856,27 @@ def gmail_important():
         msgs = result.get("messages", [])
         emails = []
         for m in msgs:
-            msg = svc.users().messages().get(userId="me", id=m["id"], format="metadata",
-                metadataHeaders=["Subject","From","Date"]).execute()
-            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-            emails.append({
-                "id": m["id"],
-                "threadId": msg.get("threadId", ""),
-                "subject": headers.get("Subject", "(no subject)"),
-                "from": headers.get("From", ""),
-                "date": headers.get("Date", ""),
-                "snippet": msg.get("snippet", ""),
-            })
+            try:
+                msg = svc.users().messages().get(
+                    userId="me", id=m["id"], format="metadata",
+                    metadataHeaders=["Subject", "From", "Date"]
+                ).execute()
+                headers = {h["name"]: h["value"]
+                           for h in msg.get("payload", {}).get("headers", [])}
+                emails.append({
+                    "id": m["id"],
+                    "threadId": msg.get("threadId", ""),
+                    "subject": headers.get("Subject", "(no subject)"),
+                    "from": headers.get("From", ""),
+                    "date": headers.get("Date", ""),
+                    "snippet": msg.get("snippet", ""),
+                })
+            except Exception as inner:
+                print(f"[GMAIL IMPORTANT] skipping message {m['id']}: {inner}")
+                continue
         return jsonify({"emails": emails})
     except Exception as e:
+        print(f"[GMAIL IMPORTANT] error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/gmail/send", methods=["POST"])
