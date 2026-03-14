@@ -489,26 +489,107 @@ def health():
 
 @app.route("/wa-webhook", methods=["POST"])
 def wa_webhook():
-    """Twilio sends incoming WhatsApp messages here."""
-    import uuid
+    """Receive incoming WhatsApp message from Twilio, store it, and auto-reply with AI."""
+    import uuid as _uuid
     from_num = request.form.get("From", "")
     body     = request.form.get("Body", "").strip()
+    # Always return empty TwiML immediately so Twilio doesn't retry
+    twiml_ok = ('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                200, {'Content-Type': 'text/xml'})
     if not body:
-        return ("", 204)
+        return twiml_ok
+
+    # 1. Store incoming message with dir='in'
     msgs = load_json("wa_inbox.json", [])
-    msg = {
-        "id":   str(uuid.uuid4()),
+    msgs.append({
+        "id":   str(_uuid.uuid4()),
         "from": from_num,
         "body": body,
-        "ts":   int(datetime.now().timestamp() * 1000)
-    }
-    msgs.append(msg)
-    # keep last 500
+        "dir":  "in",
+        "ts":   int(datetime.now().timestamp() * 1000),
+    })
     if len(msgs) > 500:
         msgs = msgs[-500:]
     save_json("wa_inbox.json", msgs)
-    print(f"WA in from {from_num}: {body[:60]}")
-    return ("", 204)
+    print(f"WA in from {from_num}: {body[:80]}")
+
+    # 2. Generate AI reply in a background thread (don't block Twilio's 15s window)
+    def _auto_reply(snapshot):
+        try:
+            # Build alternating user/assistant context from recent conversation
+            context = []
+            for m in snapshot[-20:]:
+                role = "user" if m.get("dir") == "in" else "assistant"
+                if context and context[-1]["role"] == role:
+                    # merge consecutive same-role messages
+                    context[-1]["content"] += "\n" + m["body"]
+                else:
+                    context.append({"role": role, "content": m["body"]})
+            # Anthropic requires conversation to start with 'user'
+            while context and context[0]["role"] == "assistant":
+                context.pop(0)
+            if not context:
+                context = [{"role": "user", "content": body}]
+
+            sys_prompt = (
+                "You are Onyx, Reed's personal AI assistant, responding via WhatsApp. "
+                "Reed Ferguson, Indianapolis, works at a donut shop, hunting for an office job "
+                "($18+/hr, no degree, 9-5 M-F), saving for a car, learning AI. "
+                "Be direct, conversational, and concise (1-3 sentences unless detail is needed). "
+                "Smart friend tone — no filler phrases, no 'certainly' or 'of course'."
+            )
+            headers = {
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 350,
+                    "system": sys_prompt,
+                    "messages": context,
+                },
+                timeout=25,
+            )
+            data = r.json()
+            if data.get("error"):
+                print(f"WA AI error: {data['error']}")
+                return
+            reply_text = "".join(
+                b["text"] for b in data.get("content", []) if b.get("type") == "text"
+            ).strip()
+            if not reply_text:
+                return
+
+            # 3. Send reply back to Reed via Twilio
+            to_wa = from_num if from_num.startswith("whatsapp:") else "whatsapp:" + from_num
+            Client(TWILIO_SID, TWILIO_TOKEN).messages.create(
+                body=reply_text,
+                from_="whatsapp:" + TWILIO_FROM,
+                to=to_wa,
+            )
+
+            # 4. Store AI reply so the Onyx UI poll picks it up (dir='out')
+            all_msgs = load_json("wa_inbox.json", [])
+            all_msgs.append({
+                "id":   str(_uuid.uuid4()),
+                "from": "whatsapp:" + TWILIO_FROM,
+                "body": reply_text,
+                "dir":  "out",
+                "ts":   int(datetime.now().timestamp() * 1000),
+            })
+            if len(all_msgs) > 500:
+                all_msgs = all_msgs[-500:]
+            save_json("wa_inbox.json", all_msgs)
+            print(f"WA AI reply sent: {reply_text[:80]}")
+        except Exception as e:
+            print(f"WA auto-reply error: {e}")
+
+    threading.Thread(target=_auto_reply, args=(list(msgs),), daemon=True).start()
+    return twiml_ok
 
 @app.route("/wa-messages")
 def wa_messages():
