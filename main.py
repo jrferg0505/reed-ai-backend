@@ -61,21 +61,24 @@ def _wa_send_email(to_addr, subject, body_text):
     try:
         svc = get_gmail_service()
         if not svc:
+            print("[WA SEND EMAIL] no Gmail service — token missing or expired")
             return False, "Gmail not connected — connect it in the Onyx app first"
         mime_msg = MIMEText(body_text)
         mime_msg["to"]      = to_addr
         mime_msg["subject"] = subject
         raw = base64.urlsafe_b64encode(mime_msg.as_bytes()).decode()
         svc.users().messages().send(userId="me", body={"raw": raw}).execute()
+        print(f"[WA SEND EMAIL] sent to {to_addr} / subject: {subject}")
         return True, None
     except Exception as e:
+        print(f"[WA SEND EMAIL] error: {e}")
         return False, str(e)
 
 def _wa_parse_email_intent(text):
     """Use Claude Haiku to detect & parse an email-send intent from a WhatsApp message.
     Returns a dict with parsed fields if it IS an email intent, otherwise None."""
-    # Pre-filter: skip obvious non-email messages to save API calls
-    if not re.search(r'\b(email|e-mail|send\s+a\s+message|write\s+to|message\s+to)\b',
+    # Pre-filter: skip obvious non-email messages to save an API call
+    if not re.search(r'\b(email|e-mail|send\s+(an?\s+)?email|write\s+to|message\s+to)\b',
                      text, re.IGNORECASE):
         return None
     try:
@@ -88,31 +91,42 @@ def _wa_parse_email_intent(text):
             },
             json={
                 "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 280,
-                "system": "Extract email-send intent. Reply ONLY with valid JSON, no other text.",
+                "max_tokens": 300,
+                "system": (
+                    "You extract email-send intent from messages. "
+                    "You MUST reply with ONLY a raw JSON object — no markdown, "
+                    "no code fences, no explanation, just the JSON."
+                ),
                 "messages": [{"role": "user", "content":
-                    f'Analyze: "{text}"\n\n'
-                    'Return JSON:\n'
-                    '{\n'
-                    '  "is_email": true/false,\n'
-                    '  "to_email": "addr@example.com or null",\n'
-                    '  "to_name": "Recipient name or null",\n'
-                    '  "subject": "Short subject line or null",\n'
-                    '  "body": "Full composed email body, or null if insufficient detail",\n'
-                    '  "missing": "none" | "email_address" | "message_body" | "both"\n'
-                    '}\n\n'
-                    'Rules:\n'
-                    '- is_email=true only if explicitly asking to send/compose/write an email\n'
-                    '- body=null if only a vague topic was given (not enough to write the email)\n'
-                    '- missing reflects what info is still needed to actually send the email'
+                    f'Message: "{text}"\n\n'
+                    'Respond with ONLY this JSON (no markdown fences):\n'
+                    '{"is_email":true/false,"to_email":"addr or null","to_name":"name or null",'
+                    '"subject":"subject or null","body":"full email body or null",'
+                    '"missing":"none|email_address|message_body|both"}\n\n'
+                    'is_email=true only if the user is explicitly asking to send an email.\n'
+                    'body=null if the topic is too vague to write the email text.\n'
+                    'missing=the field(s) still needed before the email can be sent.'
                 }],
             },
             timeout=12,
         )
-        out = "".join(
+        raw_out = "".join(
             b["text"] for b in r.json().get("content", []) if b.get("type") == "text"
         ).strip()
-        parsed = json.loads(out)
+        print(f"[WA EMAIL PARSE] raw response: {raw_out[:300]}")
+
+        # Strip markdown code fences if Claude added them anyway
+        cleaned = re.sub(r'^```(?:json)?\s*', '', raw_out, flags=re.MULTILINE)
+        cleaned = re.sub(r'\s*```\s*$', '', cleaned, flags=re.MULTILINE).strip()
+
+        # Extract the JSON object even if there is surrounding prose
+        m = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        if not m:
+            print(f"[WA EMAIL PARSE] no JSON object found in response")
+            return None
+
+        parsed = json.loads(m.group())
+        print(f"[WA EMAIL PARSE] parsed: {parsed}")
         return parsed if parsed.get("is_email") else None
     except Exception as e:
         print(f"[WA EMAIL PARSE] error: {e}")
