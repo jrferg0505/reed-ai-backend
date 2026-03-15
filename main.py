@@ -37,7 +37,7 @@ TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 ONYX_API_KEY  = os.environ.get("ONYX_API_KEY", "")
 
 # Routes exempt from API key check (Twilio + Google OAuth callbacks must be public)
-_PUBLIC_ROUTES = {"/wa-webhook", "/gcal/callback", "/gmail/callback", "/health"}
+_PUBLIC_ROUTES = {"/wa-webhook", "/gcal/callback", "/gmail/callback", "/health", "/ping"}
 
 @app.before_request
 def require_api_key():
@@ -825,6 +825,10 @@ def agent_spend_history():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
+
+@app.route("/ping")
+def ping():
+    return jsonify({"status": "ok", "message": "Onyx is alive"})
 
 # ── WhatsApp two-way chat ──
 # Incoming messages from Twilio webhook are stored here
