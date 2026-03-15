@@ -35,6 +35,11 @@ GMAIL_SCOPES = [
 ]
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 
+PLAID_CLIENT_ID = os.environ.get("PLAID_CLIENT_ID", "")
+PLAID_SECRET    = os.environ.get("PLAID_SECRET", "")
+PLAID_ENV       = os.environ.get("PLAID_ENV", "sandbox")
+PLAID_BASE_URL  = f"https://{PLAID_ENV}.plaid.com"
+
 # In-memory store for pending email drafts triggered via WhatsApp
 # { from_num: { "to_name", "to_email", "subject", "body", "waiting_for" } }
 wa_pending_emails = {}
@@ -546,6 +551,89 @@ def _clear_token(env_key, file_path):
         except Exception:
             pass
 
+# ── Plaid helpers ──
+def _plaid_post(path, payload):
+    """POST to Plaid API with credentials injected."""
+    r = requests.post(
+        PLAID_BASE_URL + path,
+        json={**payload, "client_id": PLAID_CLIENT_ID, "secret": PLAID_SECRET},
+        headers={"Content-Type": "application/json"},
+        timeout=15,
+    )
+    return r.json()
+
+def get_plaid_access_token():
+    """Load the stored Plaid access token (env → file fallback)."""
+    val = os.environ.get("PLAID_ACCESS_TOKEN", "")
+    if val:
+        return val
+    try:
+        with open("plaid_token.txt") as f:
+            val = f.read().strip()
+        if val:
+            os.environ["PLAID_ACCESS_TOKEN"] = val
+        return val
+    except Exception:
+        return ""
+
+def save_plaid_access_token(token):
+    os.environ["PLAID_ACCESS_TOKEN"] = token
+    try:
+        with open("plaid_token.txt", "w") as f:
+            f.write(token)
+    except Exception:
+        pass
+    print(f"[PLAID] access token saved")
+
+def plaid_get_balance_text():
+    """Return a plain-text balance summary for WhatsApp/briefing use."""
+    access_token = get_plaid_access_token()
+    if not access_token:
+        return "Bank not connected yet. Open Onyx and connect via the Finance panel."
+    data = _plaid_post("/accounts/balance/get", {"access_token": access_token})
+    if "error" in data:
+        return f"Couldn't fetch balance: {data['error'].get('error_message', 'unknown error')}"
+    accounts = data.get("accounts", [])
+    if not accounts:
+        return "No accounts found."
+    lines = []
+    for a in accounts:
+        name = a.get("name", "Account")
+        bal  = a.get("balances", {})
+        curr = bal.get("current", 0)
+        avail = bal.get("available")
+        atype = a.get("type", "")
+        if avail is not None:
+            lines.append(f"• {name} ({atype}): ${curr:,.2f} current / ${avail:,.2f} available")
+        else:
+            lines.append(f"• {name} ({atype}): ${curr:,.2f}")
+    return "💳 Account Balances:\n" + "\n".join(lines)
+
+def plaid_get_transactions_text(days=7):
+    """Return a plain-text recent-transactions summary."""
+    access_token = get_plaid_access_token()
+    if not access_token:
+        return "Bank not connected yet. Open Onyx and connect via the Finance panel."
+    end_date   = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    data = _plaid_post("/transactions/get", {
+        "access_token": access_token,
+        "start_date": start_date,
+        "end_date": end_date,
+        "options": {"count": 20, "offset": 0},
+    })
+    if "error" in data:
+        return f"Couldn't fetch transactions: {data['error'].get('error_message', 'unknown error')}"
+    txns = data.get("transactions", [])
+    if not txns:
+        return f"No transactions found in the last {days} days."
+    total_spent = sum(t["amount"] for t in txns if t["amount"] > 0)
+    lines = [f"💸 Last {days} days — {len(txns)} transactions (${total_spent:,.2f} spent):"]
+    for t in txns[:10]:
+        sign  = "-" if t["amount"] < 0 else ""
+        lines.append(f"  • {t['date']} {t['name'][:30]}: {sign}${abs(t['amount']):.2f}")
+    return "\n".join(lines)
+
 # ── Google Calendar helpers ──
 def get_gcal_creds():
     token_json = _load_token("GCAL_TOKEN", "gcal_token.json")
@@ -851,6 +939,20 @@ def wa_webhook():
                 )
                 if _BRIEFING_RE.match(body):
                     reply_text = build_daily_briefing()
+
+            # ── Path B.6: bank balance / transactions query ───────────────────
+            if reply_text is None:
+                _BANK_RE = re.compile(
+                    r'\b(balance|how\s+much.*(?:have|left|in\s+(?:my|the))|'
+                    r'what.{0,10}(?:account|bank|checking|saving)|'
+                    r'recent\s+transactions?|transaction\s+history|'
+                    r'how\s+much.*spent?|what.*(?:spend|spent)|spending\s+this\s+week|'
+                    r'bank\s+balance|account\s+balance)\b',
+                    re.IGNORECASE,
+                )
+                if _BANK_RE.search(body):
+                    is_txn = re.search(r'\b(transaction|spent|spend|spending|history)\b', body, re.IGNORECASE)
+                    reply_text = plaid_get_transactions_text(days=7) if is_txn else plaid_get_balance_text()
 
             # ── Path C: regular AI conversation ──────────────────────────────
             if reply_text is None:
@@ -1323,5 +1425,106 @@ def gmail_disconnect():
     _clear_token("GMAIL_TOKEN", "gmail_token.json")
     return jsonify({"disconnected": True})
 
+# ── Plaid Routes ──
+
+@app.route("/plaid/status")
+def plaid_status():
+    token = get_plaid_access_token()
+    if not token:
+        return jsonify({"connected": False})
+    data = _plaid_post("/accounts/balance/get", {"access_token": token})
+    if "error" in data:
+        return jsonify({"connected": False})
+    accounts = data.get("accounts", [])
+    names = [a.get("name", "") for a in accounts]
+    return jsonify({"connected": True, "accounts": names})
+
+@app.route("/plaid/link", methods=["POST"])
+def plaid_link():
+    if not PLAID_CLIENT_ID or not PLAID_SECRET:
+        return jsonify({"error": "PLAID_CLIENT_ID and PLAID_SECRET not configured in Render env vars"}), 400
+    data = _plaid_post("/link/token/create", {
+        "user": {"client_user_id": "reed"},
+        "client_name": "Onyx",
+        "products": ["transactions"],
+        "country_codes": ["US"],
+        "language": "en",
+    })
+    if "error" in data:
+        return jsonify({"error": data["error"].get("error_message", "Plaid error")}), 400
+    return jsonify({"link_token": data["link_token"]})
+
+@app.route("/plaid/exchange", methods=["POST"])
+def plaid_exchange():
+    body = request.get_json() or {}
+    public_token = body.get("public_token", "")
+    if not public_token:
+        return jsonify({"error": "No public_token"}), 400
+    data = _plaid_post("/item/public_token/exchange", {"public_token": public_token})
+    if "error" in data:
+        return jsonify({"error": data["error"].get("error_message", "Exchange failed")}), 400
+    save_plaid_access_token(data["access_token"])
+    return jsonify({"success": True})
+
+@app.route("/plaid/balance")
+def plaid_balance():
+    access_token = get_plaid_access_token()
+    if not access_token:
+        return jsonify({"error": "not_connected"}), 401
+    data = _plaid_post("/accounts/balance/get", {"access_token": access_token})
+    if "error" in data:
+        return jsonify({"error": data["error"].get("error_message", "Plaid error")}), 400
+    accounts = []
+    for a in data.get("accounts", []):
+        bal = a.get("balances", {})
+        accounts.append({
+            "account_id": a.get("account_id", ""),
+            "name":       a.get("name", "Account"),
+            "type":       a.get("type", ""),
+            "subtype":    a.get("subtype", ""),
+            "current":    bal.get("current"),
+            "available":  bal.get("available"),
+            "iso_currency_code": bal.get("iso_currency_code", "USD"),
+        })
+    return jsonify({"accounts": accounts})
+
+@app.route("/plaid/transactions")
+def plaid_transactions():
+    access_token = get_plaid_access_token()
+    if not access_token:
+        return jsonify({"error": "not_connected"}), 401
+    days = int(request.args.get("days", 30))
+    end_date   = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    data = _plaid_post("/transactions/get", {
+        "access_token": access_token,
+        "start_date": start_date,
+        "end_date": end_date,
+        "options": {"count": 50, "offset": 0},
+    })
+    if "error" in data:
+        return jsonify({"error": data["error"].get("error_message", "Plaid error")}), 400
+    txns = []
+    for t in data.get("transactions", []):
+        txns.append({
+            "transaction_id": t.get("transaction_id", ""),
+            "date":           t.get("date", ""),
+            "name":           t.get("name", ""),
+            "amount":         t.get("amount", 0),
+            "category":       t.get("category", []),
+            "account_id":     t.get("account_id", ""),
+        })
+    return jsonify({"transactions": txns, "total_transactions": data.get("total_transactions", 0)})
+
+@app.route("/plaid/disconnect", methods=["POST"])
+def plaid_disconnect():
+    os.environ.pop("PLAID_ACCESS_TOKEN", None)
+    try:
+        os.remove("plaid_token.txt")
+    except Exception:
+        pass
+    return jsonify({"disconnected": True})
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
