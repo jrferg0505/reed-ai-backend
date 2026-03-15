@@ -1464,7 +1464,11 @@ def plaid_link():
     if not PLAID_CLIENT_ID or not PLAID_SECRET:
         return jsonify({"error": "PLAID_CLIENT_ID and PLAID_SECRET not configured in Render env vars"}), 400
     data = _plaid_post("/link/token/create", {
-        "user": {"client_user_id": "reed"},
+        "user": {
+            "client_user_id": "reed",
+            "phone_number": "+13175550000",
+            "phone_number_verified_time": "2024-01-01T00:00:00Z",
+        },
         "client_name": "Onyx",
         "products": ["transactions"],
         "country_codes": ["US"],
