@@ -34,6 +34,22 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
 ]
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
+ONYX_API_KEY  = os.environ.get("ONYX_API_KEY", "")
+
+# Routes exempt from API key check (Twilio + Google OAuth callbacks must be public)
+_PUBLIC_ROUTES = {"/wa-webhook", "/gcal/callback", "/gmail/callback", "/health"}
+
+@app.before_request
+def require_api_key():
+    if request.method == "OPTIONS":
+        return  # let CORS preflight through
+    if request.path in _PUBLIC_ROUTES:
+        return  # public endpoints
+    if not ONYX_API_KEY:
+        return  # key not configured yet — fail open so existing setup isn't broken
+    provided = request.headers.get("X-API-Key", "")
+    if provided != ONYX_API_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
 
 PLAID_CLIENT_ID = os.environ.get("PLAID_CLIENT_ID", "")
 PLAID_SECRET    = os.environ.get("PLAID_SECRET", "")
