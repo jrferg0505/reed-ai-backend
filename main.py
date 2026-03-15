@@ -27,6 +27,7 @@ GOOGLE_REDIRECT_URI  = os.environ.get("GOOGLE_REDIRECT_URI", "https://reed-ai-ba
 GCAL_SCOPES = [
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/documents.readonly",
 ]
 GMAIL_REDIRECT_URI = os.environ.get("GMAIL_REDIRECT_URI", "https://reed-ai-backend.onrender.com/gmail/callback")
 GMAIL_SCOPES = [
@@ -35,6 +36,7 @@ GMAIL_SCOPES = [
 ]
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 ONYX_API_KEY  = os.environ.get("ONYX_API_KEY", "")
+HOURLY_RATE   = float(os.environ.get("HOURLY_RATE", "0"))
 
 # Routes exempt from API key check (Twilio + Google OAuth callbacks must be public)
 _PUBLIC_ROUTES = {"/wa-webhook", "/gcal/callback", "/gmail/callback", "/health", "/ping"}
@@ -519,7 +521,8 @@ scheduler.add_job(weekly_savings,      CronTrigger(day_of_week="sun", hour=20, m
 scheduler.add_job(daily_spend_ask,     CronTrigger(hour=22, minute=0, timezone=TIMEZONE),                   id="daily_spend_ask",     replace_existing=True)
 scheduler.add_job(weekly_spend_report, CronTrigger(day_of_week="tue", hour=16, minute=0, timezone=TIMEZONE),id="weekly_spend_report", replace_existing=True)
 scheduler.add_job(daily_spend_report,  CronTrigger(hour=21, minute=0, timezone=TIMEZONE),                   id="daily_spend_report",  replace_existing=True)
-scheduler.add_job(keep_alive,          "interval", minutes=5,                                               id="keep_alive",          replace_existing=True)
+scheduler.add_job(keep_alive,            "interval", minutes=5,                                               id="keep_alive",            replace_existing=True)
+scheduler.add_job(shift_reminder_check,  "interval", minutes=5,                                               id="shift_reminder",        replace_existing=True)
 scheduler.start()
 print(f"Scheduler started ({TIMEZONE}). On-demand briefing active.")
 
@@ -703,6 +706,152 @@ def gcal_events_text(days=3):
     except Exception as e:
         print(f"gcal_events_text error: {e}")
         return ""
+
+# ── Google Docs / Schedule helpers ──
+
+def get_gdocs_service():
+    creds = get_gcal_creds()
+    if not creds:
+        return None
+    try:
+        return build("docs", "v1", credentials=creds)
+    except Exception as e:
+        print(f"[DOCS] build error: {e}")
+        return None
+
+def _extract_gdoc_text(doc):
+    """Walk Google Docs API response and return plain text."""
+    parts = []
+    def walk_content(content):
+        for elem in content:
+            if "paragraph" in elem:
+                for pe in elem["paragraph"].get("elements", []):
+                    if "textRun" in pe:
+                        parts.append(pe["textRun"].get("content", ""))
+            elif "table" in elem:
+                for row in elem["table"].get("tableRows", []):
+                    for cell in row.get("tableCells", []):
+                        walk_content(cell.get("content", []))
+    walk_content(doc.get("body", {}).get("content", []))
+    return "".join(parts)
+
+def parse_shifts_with_ai(text):
+    """Call Claude to extract shifts from doc text. Returns list of shift dicts."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    prompt = (
+        f"Today is {today}. Extract all work shifts from the following schedule document.\n"
+        "Return ONLY a JSON array (no markdown, no explanation) like:\n"
+        '[{"date":"2026-03-16","day":"Monday","start":"09:00","end":"17:00","hours":8.0}]\n'
+        "Rules: 24h time, dates as YYYY-MM-DD. Calculate hours from start/end if not listed.\n"
+        "Only include shifts that appear to belong to Reed Ferguson (or if no names, include all).\n"
+        "Return [] if no shifts found.\n\n"
+        f"Document:\n{text[:6000]}"
+    )
+    result = ask_claude(prompt, max_tokens=1024)
+    try:
+        # Strip any accidental markdown fences
+        clean = re.sub(r"```[a-z]*", "", result).strip()
+        shifts = json.loads(clean)
+        if isinstance(shifts, list):
+            return shifts
+    except Exception as e:
+        print(f"[SCHEDULE] AI parse error: {e} | raw: {result[:200]}")
+    return []
+
+def add_shift_to_calendar(svc, shift):
+    """Add a single shift to Google Calendar. Skip if an event already exists."""
+    try:
+        date_str  = shift["date"]        # YYYY-MM-DD
+        start_str = shift["start"]       # HH:MM (24h)
+        end_str   = shift["end"]         # HH:MM (24h)
+        # Build RFC3339 datetimes (local timezone)
+        import pytz
+        tz = pytz.timezone(TIMEZONE)
+        start_dt = tz.localize(datetime.strptime(f"{date_str} {start_str}", "%Y-%m-%d %H:%M"))
+        end_dt   = tz.localize(datetime.strptime(f"{date_str} {end_str}",   "%Y-%m-%d %H:%M"))
+        # Check for existing events on that day that look like a shift
+        day_start = tz.localize(datetime.strptime(date_str, "%Y-%m-%d"))
+        day_end   = day_start + timedelta(days=1)
+        existing  = svc.events().list(
+            calendarId="primary",
+            timeMin=day_start.isoformat(),
+            timeMax=day_end.isoformat(),
+            q="Work",
+            singleEvents=True,
+        ).execute().get("items", [])
+        for ev in existing:
+            if ev.get("summary", "").startswith("Work"):
+                print(f"[SCHEDULE] skipping duplicate on {date_str}")
+                return False
+        svc.events().insert(calendarId="primary", body={
+            "summary": "Work — Donut Shop",
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": TIMEZONE},
+            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": TIMEZONE},
+            "description": f"Shift synced by Onyx | {shift.get('hours','')} hrs",
+            "colorId": "6",  # tangerine
+        }).execute()
+        return True
+    except Exception as e:
+        print(f"[SCHEDULE] add_event error: {e}")
+        return False
+
+def get_shifts_text():
+    """Return upcoming shifts as plain text for WhatsApp/chat."""
+    shifts = load_json("shifts.json", [])
+    today  = datetime.now().strftime("%Y-%m-%d")
+    upcoming = [s for s in shifts if s.get("date", "") >= today]
+    if not upcoming:
+        return "No upcoming shifts synced. Paste your schedule doc in the Schedule panel."
+    lines = ["📅 Upcoming Shifts:"]
+    total_hrs = 0.0
+    for s in upcoming[:7]:
+        hrs = s.get("hours", 0)
+        total_hrs += float(hrs)
+        lines.append(f"  • {s.get('day','')} {s['date']}  {s['start']}–{s['end']}  ({hrs}h)")
+    if HOURLY_RATE > 0:
+        lines.append(f"\n💵 Projected paycheck: ${total_hrs * HOURLY_RATE:,.2f}")
+    return "\n".join(lines)
+
+def get_next_shift_text():
+    """Return just the next upcoming shift."""
+    shifts = load_json("shifts.json", [])
+    today  = datetime.now().strftime("%Y-%m-%d")
+    upcoming = sorted([s for s in shifts if s.get("date","") >= today], key=lambda x: x["date"])
+    if not upcoming:
+        return "No upcoming shifts found."
+    s = upcoming[0]
+    hrs = s.get("hours", 0)
+    msg = f"Your next shift is {s.get('day','')} {s['date']} from {s['start']} to {s['end']} ({hrs}h)"
+    if HOURLY_RATE > 0:
+        msg += f"  — that's ${float(hrs)*HOURLY_RATE:,.2f} for that shift."
+    return msg
+
+def shift_reminder_check():
+    """Run every 5 min — send WhatsApp if a shift starts in ~1 hour."""
+    try:
+        import pytz
+        tz = pytz.timezone(TIMEZONE)
+        now = datetime.now(tz)
+        shifts = load_json("shifts.json", [])
+        reminded = load_json("shifts_reminded.json", [])
+        for s in shifts:
+            key = f"{s['date']}-{s['start']}"
+            if key in reminded:
+                continue
+            try:
+                start_dt = tz.localize(datetime.strptime(f"{s['date']} {s['start']}", "%Y-%m-%d %H:%M"))
+            except Exception:
+                continue
+            delta_min = (start_dt - now).total_seconds() / 60
+            if 55 <= delta_min <= 65:
+                msg = (f"⏰ Shift reminder: You work in 1 hour!\n"
+                       f"📍 {s.get('day','')} {s['start']}–{s['end']} ({s.get('hours','')}h)")
+                send_whatsapp(msg)
+                reminded.append(key)
+                save_json("shifts_reminded.json", reminded)
+                print(f"[SCHEDULE] sent reminder for {key}")
+    except Exception as e:
+        print(f"[SCHEDULE] reminder error: {e}")
 
 @app.route("/")
 def index(): return jsonify({"status": "Reed AI Backend Running", "time": datetime.now().isoformat()})
@@ -973,6 +1122,30 @@ def wa_webhook():
                 if _BANK_RE.search(body):
                     is_txn = re.search(r'\b(transaction|spent|spend|spending|history)\b', body, re.IGNORECASE)
                     reply_text = plaid_get_transactions_text(days=7) if is_txn else plaid_get_balance_text()
+
+            # ── Path B.7: work schedule queries ──────────────────────────────
+            if reply_text is None:
+                _SCHED_RE = re.compile(
+                    r'\b(when\s+do\s+i\s+work|next\s+shift|my\s+shift|work\s+(this\s+week|today|tomorrow|schedule)|'
+                    r'how\s+many\s+hours|paycheck|pay\s*check|how\s+much.*pay|what.*i\s+make|'
+                    r'shift\s+this\s+week|when\s+am\s+i\s+work)\b',
+                    re.IGNORECASE,
+                )
+                if _SCHED_RE.search(body):
+                    is_next = re.search(r'\b(next|today|tomorrow)\b', body, re.IGNORECASE)
+                    is_pay  = re.search(r'\b(paycheck|pay\s*check|how\s+much.*pay|what.*make)\b', body, re.IGNORECASE)
+                    if is_pay:
+                        shifts = load_json("shifts.json", [])
+                        today_str = datetime.now().strftime("%Y-%m-%d")
+                        total_hrs = sum(float(s.get("hours",0)) for s in shifts if s.get("date","") >= today_str)
+                        if HOURLY_RATE > 0 and total_hrs > 0:
+                            reply_text = f"💵 Projected paycheck: ${total_hrs * HOURLY_RATE:,.2f} ({total_hrs}h × ${HOURLY_RATE}/hr)"
+                        else:
+                            reply_text = "No shifts or hourly rate configured yet."
+                    elif is_next:
+                        reply_text = get_next_shift_text()
+                    else:
+                        reply_text = get_shifts_text()
 
             # ── Path C: regular AI conversation ──────────────────────────────
             if reply_text is None:
@@ -1548,6 +1721,67 @@ def plaid_disconnect():
     except Exception:
         pass
     return jsonify({"disconnected": True})
+
+# ── Schedule Routes ──
+
+@app.route("/schedule/sync", methods=["POST"])
+def schedule_sync():
+    body = request.get_json() or {}
+    doc_url = body.get("doc_url", "").strip()
+    if not doc_url:
+        return jsonify({"error": "doc_url required"}), 400
+    # Extract Google Doc ID from URL
+    m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", doc_url)
+    if not m:
+        return jsonify({"error": "Could not find a Google Doc ID in that URL"}), 400
+    doc_id = m.group(1)
+    # Fetch doc
+    svc = get_gdocs_service()
+    if not svc:
+        return jsonify({"error": "Google not authorized. Re-authorize Google Calendar in Onyx Settings to grant Docs access."}), 401
+    try:
+        doc = svc.documents().get(documentId=doc_id).execute()
+    except Exception as e:
+        err_str = str(e)
+        if "insufficientPermissions" in err_str or "403" in err_str:
+            return jsonify({"error": "Docs access not yet granted. Please re-authorize Google Calendar in Onyx → Settings."}), 403
+        return jsonify({"error": f"Could not read doc: {err_str[:120]}"}), 400
+    text = _extract_gdoc_text(doc)
+    if not text.strip():
+        return jsonify({"error": "Doc appears empty or has no readable text"}), 400
+    # Parse shifts
+    shifts = parse_shifts_with_ai(text)
+    if not shifts:
+        return jsonify({"error": "No shifts found in document. Make sure it's the right schedule."}), 400
+    # Save shifts
+    save_json("shifts.json", shifts)
+    save_json("shifts_reminded.json", [])
+    # Add to Google Calendar
+    cal_svc = get_gcal_service()
+    added = 0
+    if cal_svc:
+        for s in shifts:
+            if add_shift_to_calendar(cal_svc, s):
+                added += 1
+    # Calculate paycheck
+    today = datetime.now().strftime("%Y-%m-%d")
+    total_hrs = sum(float(s.get("hours", 0)) for s in shifts if s.get("date","") >= today)
+    paycheck = round(total_hrs * HOURLY_RATE, 2) if HOURLY_RATE > 0 else None
+    return jsonify({"shifts": shifts, "calendar_events_added": added, "total_hours": total_hrs, "projected_paycheck": paycheck})
+
+@app.route("/schedule/shifts")
+def schedule_shifts():
+    shifts = load_json("shifts.json", [])
+    today  = datetime.now().strftime("%Y-%m-%d")
+    total_hrs = sum(float(s.get("hours", 0)) for s in shifts if s.get("date","") >= today)
+    paycheck  = round(total_hrs * HOURLY_RATE, 2) if HOURLY_RATE > 0 else None
+    return jsonify({"shifts": shifts, "total_hours": total_hrs, "projected_paycheck": paycheck, "hourly_rate": HOURLY_RATE})
+
+@app.route("/schedule/shifts/clear", methods=["POST"])
+def schedule_shifts_clear():
+    save_json("shifts.json", [])
+    save_json("shifts_reminded.json", [])
+    return jsonify({"cleared": True})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
