@@ -41,6 +41,27 @@ GOVEE_API_KEY  = os.environ.get("GOVEE_API_KEY", "")
 GOVEE_BASE     = "https://developer-api.govee.com/v1/devices"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
+ONYX_PERSONALITY = (
+    "You are Onyx — Reed's personal AI. Not a chatbot, not a corporate assistant. "
+    "Think of yourself as that one friend who's brutally honest, actually knows what they're talking about, "
+    "and genuinely gives a damn about how things turn out for Reed. "
+    "\n\n"
+    "Reed Ferguson: works the early shift at a donut shop in Indianapolis. "
+    "Hunting for an office job — $18+/hr, no degree required, 9-5 M-F. "
+    "Saving up for his own car. Teaching himself AI and tech. Big goals, actively building toward them. "
+    "\n\n"
+    "How you talk: "
+    "Direct and confident — get to the point, no fluff. "
+    "Smart-friend energy — not a yes-man, not a corporate drone. "
+    "Dry wit when it fits. Serious when it matters. "
+    "If Reed says something off, call it out — respectfully but honestly. "
+    "When he hits a goal or does something good, acknowledge it like you mean it — "
+    "not 'Great job!' but something real. "
+    "Short answers for simple questions. Go longer only when detail is genuinely needed. "
+    "Never start with filler: no 'Sure!', 'Great question!', 'Certainly!', 'Of course!'. "
+    "You are Onyx. Never say 'as an AI' or 'I don't have feelings' — just respond naturally."
+)
+
 # Routes exempt from API key check (Twilio + Google OAuth callbacks must be public)
 _PUBLIC_ROUTES = {"/wa-webhook", "/gcal/callback", "/gmail/callback", "/health", "/ping"}
 
@@ -236,9 +257,11 @@ def _wa_parse_email_intent(text):
         }
     return None
 
-def ask_claude(prompt, use_search=False, max_tokens=1024, timeout=25):
+def ask_claude(prompt, use_search=False, max_tokens=1024, timeout=25, system=None):
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     body = {"model": "claude-sonnet-4-5", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}
+    if system:
+        body["system"] = system
     if use_search:
         headers["anthropic-beta"] = "web-search-2025-03-05"
         body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
@@ -405,11 +428,12 @@ def mood_checkin():
     print("Running mood check-in...")
     try:
         day = datetime.now().strftime("%A")
-        text = ask_claude(f"""Send Reed a quick end-of-day check-in. Today is {day}.
-Under 200 chars. Casual, genuine.
-Hey Reed 🌙
-[One sentence asking how his day went]
-Reply back and I'll listen.""")
+        text = ask_claude(
+            f"Send Reed a quick end-of-day check-in for {day}. "
+            "Under 160 chars. Casual, genuine — sound like a friend texting, not a bot. "
+            "One sentence check-in, then 'Reply and let me know.' No emojis required.",
+            system=ONYX_PERSONALITY
+        )
         send_whatsapp(text)
         print("Mood check-in sent.")
     except Exception as e:
@@ -418,10 +442,12 @@ Reply back and I'll listen.""")
 def weekly_recap():
     print("Running weekly recap...")
     try:
-        text = ask_claude("""Write Reed a brief weekly job search motivation text. Under 280 chars.
-📊 Weekly Check-In
-[2 sentences: acknowledge grind, specific encouragement]
-This Week: [One concrete action]""")
+        text = ask_claude(
+            "Send Reed a quick weekly check-in about his job search. Under 250 chars. "
+            "Acknowledge the grind honestly, give one specific concrete action for this week. "
+            "Sound like a real person, not a motivational poster.",
+            system=ONYX_PERSONALITY
+        )
         send_whatsapp(text)
     except Exception as e:
         print(f"Weekly recap error: {e}")
@@ -510,7 +536,7 @@ def run_agent_task(task_type, custom_prompt=None):
         elif task_type == "checkin": mood_checkin()
         elif task_type == "custom" and custom_prompt:
             send_whatsapp("🤖 Working On It...")
-            result = ask_claude(f"You are Reed's AI. Reed: Indianapolis, donut shop, hunting $18+/hr office job, saving for car, learning AI. Direct, capitalize every word, under 500 chars.\nTask: {custom_prompt}", use_search=True)
+            result = ask_claude(f"Task: {custom_prompt}\nUnder 500 chars.", use_search=True, system=ONYX_PERSONALITY)
             send_whatsapp(f"✅ Done:\n{result}")
     except Exception as e:
         send_whatsapp(f"❌ Error: {str(e)[:100]}")
@@ -1303,13 +1329,7 @@ def wa_webhook():
                     json={
                         "model": "claude-haiku-4-5-20251001",
                         "max_tokens": 350,
-                        "system": (
-                            "You are Onyx, Reed's personal AI assistant, responding via WhatsApp. "
-                            "Reed Ferguson, Indianapolis, works at a donut shop, hunting for an office job "
-                            "($18+/hr, no degree, 9-5 M-F), saving for a car, learning AI. "
-                            "Be direct, conversational, and concise (1-3 sentences unless detail is needed). "
-                            "Smart friend tone — no filler phrases, no 'certainly' or 'of course'."
-                        ),
+                        "system": ONYX_PERSONALITY + " You're replying via WhatsApp — keep it concise, 1-3 sentences max unless real detail is needed.",
                         "messages": context,
                     },
                     timeout=25,
