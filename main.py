@@ -2020,6 +2020,107 @@ def memory_extract():
     except Exception as e:
         return jsonify({"extracted": [], "error": str(e)})
 
+# ── Dashboard Route ────────────────────────────────────────────────────────
+
+@app.route("/dashboard")
+def dashboard():
+    """Single endpoint that returns all data for the Jarvis dashboard."""
+    data = {}
+
+    # 1. Weather — wttr.in JSON (no API key needed)
+    try:
+        r = requests.get("https://wttr.in/Indianapolis?format=j1", timeout=5)
+        if r.ok:
+            w = r.json()
+            curr = w["current_condition"][0]
+            today_w = w["weather"][0]
+            data["weather"] = {
+                "temp":      curr.get("temp_F", "—"),
+                "feels":     curr.get("FeelsLikeF", "—"),
+                "condition": curr.get("weatherDesc", [{}])[0].get("value", ""),
+                "high":      today_w.get("maxtempF", "—"),
+                "low":       today_w.get("mintempF", "—"),
+            }
+        else:
+            data["weather"] = None
+    except Exception:
+        data["weather"] = None
+
+    # 2. Calendar — next 3 events
+    try:
+        svc = get_gcal_service()
+        if svc:
+            now_utc = datetime.utcnow().isoformat() + "Z"
+            end_utc = (datetime.utcnow() + timedelta(days=7)).isoformat() + "Z"
+            result = svc.events().list(
+                calendarId="primary", timeMin=now_utc, timeMax=end_utc,
+                maxResults=3, singleEvents=True, orderBy="startTime"
+            ).execute()
+            events = []
+            for e in result.get("items", []):
+                start = e["start"].get("dateTime", e["start"].get("date", ""))
+                events.append({
+                    "title":  e.get("summary", "(no title)"),
+                    "start":  start,
+                    "allDay": "T" not in e["start"].get("dateTime", "T"),
+                    "location": e.get("location", ""),
+                })
+            data["calendar"] = events
+        else:
+            data["calendar"] = None
+    except Exception:
+        data["calendar"] = None
+
+    # 3. Gmail — 3 most recent important emails
+    try:
+        svc = get_gmail_service()
+        if svc:
+            result = svc.users().messages().list(
+                userId="me", q="is:important", maxResults=3
+            ).execute()
+            emails = []
+            for m in result.get("messages", []):
+                try:
+                    msg = svc.users().messages().get(
+                        userId="me", id=m["id"], format="metadata",
+                        metadataHeaders=["Subject", "From", "Date"]
+                    ).execute()
+                    hdrs = {h["name"]: h["value"]
+                            for h in msg.get("payload", {}).get("headers", [])}
+                    emails.append({
+                        "subject": hdrs.get("Subject", "(no subject)"),
+                        "from":    hdrs.get("From", ""),
+                        "snippet": msg.get("snippet", ""),
+                    })
+                except Exception:
+                    continue
+            data["emails"] = emails
+        else:
+            data["emails"] = None
+    except Exception:
+        data["emails"] = None
+
+    # 4. Next shift + paycheck projection
+    try:
+        shifts = load_json("shifts.json", [])
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        upcoming = sorted(
+            [s for s in shifts if s.get("date", "") >= today_str],
+            key=lambda s: s.get("date", "")
+        )
+        if upcoming:
+            nxt = upcoming[0]
+            total_hrs = sum(float(s.get("hours", 0)) for s in upcoming)
+            gross = round(total_hrs * HOURLY_RATE, 2) if HOURLY_RATE > 0 else None
+            pay = paycheck_breakdown(gross) if gross is not None else None
+            data["shift"] = {"next": nxt, "paycheck": pay}
+        else:
+            data["shift"] = None
+    except Exception:
+        data["shift"] = None
+
+    return jsonify(data)
+
 # ── Voice Routes ──
 
 @app.route("/voice/transcribe", methods=["POST"])
