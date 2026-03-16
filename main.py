@@ -62,6 +62,53 @@ ONYX_PERSONALITY = (
     "You are Onyx. Never say 'as an AI' or 'I don't have feelings' — just respond naturally."
 )
 
+AGENT_PROMPTS = {
+    "research": (
+        "RESEARCH AGENT: Handle general knowledge, explanations, advice, job tips, AI/tech questions, "
+        "and anything else. Search the web for live data when needed. Be sharp and specific — no vague generalities."
+    ),
+    "calendar": (
+        "CALENDAR AGENT: You specialize in Reed's schedule, shifts, and time management. "
+        "Real calendar and shift data is injected below. Be specific about dates and times. "
+        "Help Reed plan, spot conflicts, and never miss a shift. Format times clearly (e.g. 'Mon Mar 18, 4–11am')."
+    ),
+    "gmail": (
+        "GMAIL AGENT: You specialize in Reed's email. Real inbox data is injected below. "
+        "Flag what actually matters — job opportunities, important notices, anything requiring action. "
+        "When drafting, write like Reed talks: direct and professional without being stiff."
+    ),
+    "finance": (
+        "FINANCE AGENT: You specialize in Reed's money. Real bank data is injected below. "
+        "Be specific with numbers. Track spending patterns and help him save toward his car goal. "
+        "Call out wasteful spending if you see it."
+    ),
+    "home": (
+        "HOME AGENT: You specialize in Reed's smart home via Govee. Control lights and devices directly. "
+        "When Reed says 'turn on the lights' or 'make it dim' — do it and confirm what changed."
+    ),
+    "master": (
+        "MASTER AGENT: This question spans multiple areas — calendar, email, finances, and/or home. "
+        "Handle each part precisely and combine into one clean response. Don't repeat yourself or pad the answer."
+    ),
+}
+
+def detect_agent(text: str) -> str:
+    """Keyword-based agent routing — mirrors frontend detectAgents()."""
+    import re
+    t = text.lower()
+    agents = set()
+    if re.search(r'\b(schedule|shift|work|calendar|event|appointment|when (do|am|is|does)|my day|today|tomorrow|next week|upcoming|plans|free time)\b', t):
+        agents.add("calendar")
+    if re.search(r'\b(email|inbox|gmail|message|mail|unread|reply|send.*(email|message)|wrote to|hear(d)? from)\b', t):
+        agents.add("gmail")
+    if re.search(r'\b(balance|spend|spent|transaction|bank|money|pay|budget|\$\d|how much|afford|saving|savings|account)\b', t):
+        agents.add("finance")
+    if re.search(r'\b(light|lamp|govee|turn (on|off|the)|dim|bright|color|bedroom|living room|lights)\b', t):
+        agents.add("home")
+    if not agents:
+        agents.add("research")
+    return "master" if len(agents) > 1 else next(iter(agents))
+
 # Routes exempt from API key check (Twilio + Google OAuth callbacks must be public)
 _PUBLIC_ROUTES = {"/wa-webhook", "/gcal/callback", "/gmail/callback", "/health", "/ping"}
 
@@ -1329,7 +1376,11 @@ def wa_webhook():
                     json={
                         "model": "claude-haiku-4-5-20251001",
                         "max_tokens": 350,
-                        "system": ONYX_PERSONALITY + " You're replying via WhatsApp — keep it concise, 1-3 sentences max unless real detail is needed.",
+                        "system": (
+                            ONYX_PERSONALITY + "\n\n" +
+                            AGENT_PROMPTS.get(detect_agent(body), AGENT_PROMPTS["research"]) +
+                            "\n\nYou're replying via WhatsApp — keep it concise, 1-3 sentences max unless real detail is needed."
+                        ),
                         "messages": context,
                     },
                     timeout=25,
