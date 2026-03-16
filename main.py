@@ -37,8 +37,9 @@ GMAIL_SCOPES = [
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 ONYX_API_KEY  = os.environ.get("ONYX_API_KEY", "")
 HOURLY_RATE   = float(os.environ.get("HOURLY_RATE", "0"))
-GOVEE_API_KEY = os.environ.get("GOVEE_API_KEY", "")
-GOVEE_BASE    = "https://developer-api.govee.com/v1/devices"
+GOVEE_API_KEY  = os.environ.get("GOVEE_API_KEY", "")
+GOVEE_BASE     = "https://developer-api.govee.com/v1/devices"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 # Routes exempt from API key check (Twilio + Google OAuth callbacks must be public)
 _PUBLIC_ROUTES = {"/wa-webhook", "/gcal/callback", "/gmail/callback", "/health", "/ping"}
@@ -1888,6 +1889,57 @@ def govee_control():
     else:
         ok, detail = govee_control_all(cmd_name, cmd_value)
         return jsonify({"ok": ok, "detail": detail})
+
+# ── Voice Routes ──
+
+@app.route("/voice/transcribe", methods=["POST"])
+def voice_transcribe():
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OPENAI_API_KEY not configured"}), 503
+    if "audio" not in request.files:
+        return jsonify({"error": "audio file required"}), 400
+    audio_file = request.files["audio"]
+    try:
+        r = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files={"file": (audio_file.filename or "audio.webm",
+                            audio_file.stream,
+                            audio_file.content_type or "audio/webm")},
+            data={"model": "whisper-1"},
+            timeout=30,
+        )
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/voice/tts", methods=["POST"])
+def voice_tts():
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "OPENAI_API_KEY not configured"}), 503
+    data = request.get_json() or {}
+    text = data.get("text", "").strip()
+    if not text:
+        return jsonify({"error": "text required"}), 400
+    # Strip markdown so it's not read literally
+    text = re.sub(r'\*+', '', text)
+    text = re.sub(r'#+\s*', '', text)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = text[:4096]  # OpenAI TTS max
+    try:
+        from flask import Response as FlaskResponse
+        r = requests.post(
+            "https://api.openai.com/v1/audio/speech",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": "tts-1", "input": text, "voice": "onyx"},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return jsonify({"error": r.text[:200]}), r.status_code
+        return FlaskResponse(r.content, content_type="audio/mpeg")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ── Schedule Routes ──
 
