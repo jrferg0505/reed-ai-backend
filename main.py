@@ -1906,7 +1906,7 @@ def voice_transcribe():
             files={"file": (audio_file.filename or "audio.webm",
                             audio_file.stream,
                             audio_file.content_type or "audio/webm")},
-            data={"model": "whisper-1"},
+            data={"model": "whisper-1", **( {"prompt": request.form.get("prompt")} if request.form.get("prompt") else {} )},
             timeout=30,
         )
         return jsonify(r.json()), r.status_code
