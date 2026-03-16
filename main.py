@@ -233,20 +233,21 @@ def _wa_parse_email_intent(text):
         }
     return None
 
-def ask_claude(prompt, use_search=False, max_tokens=1024):
+def ask_claude(prompt, use_search=False, max_tokens=1024, timeout=25):
     headers = {"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"}
     body = {"model": "claude-sonnet-4-5", "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]}
     if use_search:
         headers["anthropic-beta"] = "web-search-2025-03-05"
         body["tools"] = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
-    r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body)
+    r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=timeout)
     data = r.json()
     if data.get("error"): raise Exception(data["error"]["message"])
     if data.get("stop_reason") == "tool_use" and use_search:
         r = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json={
             "model": "claude-sonnet-4-5", "max_tokens": max_tokens,
             "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}],
-            "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": data["content"]}]})
+            "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": data["content"]}]},
+            timeout=timeout)
         data = r.json()
     text = "".join(b["text"] for b in data.get("content", []) if b.get("type") == "text")
     try:
@@ -1725,47 +1726,92 @@ def plaid_disconnect():
 
 @app.route("/schedule/sync", methods=["POST"])
 def schedule_sync():
+    import concurrent.futures, time
+    t0 = time.time()
+    def elapsed(): return f"{time.time()-t0:.1f}s"
+
     body = request.get_json() or {}
     doc_url = body.get("doc_url", "").strip()
     if not doc_url:
         return jsonify({"error": "doc_url required"}), 400
-    # Extract Google Doc ID from URL
+
     m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", doc_url)
     if not m:
         return jsonify({"error": "Could not find a Google Doc ID in that URL"}), 400
     doc_id = m.group(1)
-    # Fetch doc
+    print(f"[SCHEDULE SYNC] start — doc_id={doc_id}")
+
+    # ── Step 1: fetch Google Doc ──────────────────────────────────────────────
+    print(f"[SCHEDULE SYNC] step 1: fetching doc ({elapsed()})")
     svc = get_gdocs_service()
     if not svc:
-        return jsonify({"error": "Google not authorized. Re-authorize Google Calendar in Onyx Settings to grant Docs access."}), 401
+        print(f"[SCHEDULE SYNC] step 1 FAIL: no Google Docs service — token missing or lacks Docs scope")
+        return jsonify({"error": "Google not authorized. Re-authorize Google Calendar in Onyx to grant Docs access."}), 401
     try:
-        doc = svc.documents().get(documentId=doc_id).execute()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(svc.documents().get(documentId=doc_id).execute)
+            doc = future.result(timeout=10)
+    except concurrent.futures.TimeoutError:
+        print(f"[SCHEDULE SYNC] step 1 TIMEOUT after 10s fetching doc")
+        return jsonify({"error": "Timed out fetching the Google Doc (>10s). Check that the doc is shared/accessible."}), 504
     except Exception as e:
         err_str = str(e)
+        print(f"[SCHEDULE SYNC] step 1 ERROR: {err_str}")
         if "insufficientPermissions" in err_str or "403" in err_str:
-            return jsonify({"error": "Docs access not yet granted. Please re-authorize Google Calendar in Onyx → Settings."}), 403
-        return jsonify({"error": f"Could not read doc: {err_str[:120]}"}), 400
+            return jsonify({"error": "Docs scope not granted. Re-authorize Google Calendar in Onyx → Settings."}), 403
+        if "404" in err_str:
+            return jsonify({"error": "Doc not found — make sure the link is correct and the doc is shared."}), 404
+        return jsonify({"error": f"Could not read doc: {err_str[:150]}"}), 400
+
     text = _extract_gdoc_text(doc)
+    print(f"[SCHEDULE SYNC] step 1 OK: extracted {len(text)} chars ({elapsed()})")
     if not text.strip():
-        return jsonify({"error": "Doc appears empty or has no readable text"}), 400
-    # Parse shifts
-    shifts = parse_shifts_with_ai(text)
+        return jsonify({"error": "Doc appears empty or has no readable text."}), 400
+
+    # ── Step 2: parse shifts with AI ─────────────────────────────────────────
+    print(f"[SCHEDULE SYNC] step 2: parsing shifts with AI ({elapsed()})")
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(parse_shifts_with_ai, text)
+            shifts = future.result(timeout=20)
+    except concurrent.futures.TimeoutError:
+        print(f"[SCHEDULE SYNC] step 2 TIMEOUT after 20s in AI parse")
+        return jsonify({"error": "AI timed out parsing the schedule (>20s). Try again."}), 504
+    except Exception as e:
+        print(f"[SCHEDULE SYNC] step 2 ERROR: {e}")
+        return jsonify({"error": f"AI parse failed: {str(e)[:150]}"}), 500
+
+    print(f"[SCHEDULE SYNC] step 2 OK: found {len(shifts)} shifts ({elapsed()})")
     if not shifts:
-        return jsonify({"error": "No shifts found in document. Make sure it's the right schedule."}), 400
-    # Save shifts
+        return jsonify({"error": "No shifts found in document. Make sure it's the correct weekly schedule."}), 400
+
     save_json("shifts.json", shifts)
     save_json("shifts_reminded.json", [])
-    # Add to Google Calendar
-    cal_svc = get_gcal_service()
+
+    # ── Step 3: add to Google Calendar ───────────────────────────────────────
+    print(f"[SCHEDULE SYNC] step 3: adding {len(shifts)} shifts to Google Calendar ({elapsed()})")
     added = 0
-    if cal_svc:
+    cal_svc = get_gcal_service()
+    if not cal_svc:
+        print(f"[SCHEDULE SYNC] step 3 SKIP: no Calendar service")
+    else:
         for s in shifts:
-            if add_shift_to_calendar(cal_svc, s):
-                added += 1
-    # Calculate paycheck
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    future = ex.submit(add_shift_to_calendar, cal_svc, s)
+                    if future.result(timeout=8):
+                        added += 1
+            except concurrent.futures.TimeoutError:
+                print(f"[SCHEDULE SYNC] step 3 timeout on shift {s.get('date')} — skipping")
+            except Exception as e:
+                print(f"[SCHEDULE SYNC] step 3 error on shift {s.get('date')}: {e}")
+
+    print(f"[SCHEDULE SYNC] step 3 OK: added {added} calendar events ({elapsed()})")
+
     today = datetime.now().strftime("%Y-%m-%d")
-    total_hrs = sum(float(s.get("hours", 0)) for s in shifts if s.get("date","") >= today)
+    total_hrs = sum(float(s.get("hours", 0)) for s in shifts if s.get("date", "") >= today)
     paycheck = round(total_hrs * HOURLY_RATE, 2) if HOURLY_RATE > 0 else None
+    print(f"[SCHEDULE SYNC] done — {len(shifts)} shifts, {added} cal events, {total_hrs}h, ${paycheck} ({elapsed()})")
     return jsonify({"shifts": shifts, "calendar_events_added": added, "total_hours": total_hrs, "projected_paycheck": paycheck})
 
 @app.route("/schedule/shifts")
