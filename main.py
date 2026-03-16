@@ -1735,7 +1735,7 @@ def schedule_sync():
     if not doc_url:
         return jsonify({"error": "doc_url required"}), 400
 
-    m = re.search(r"/document/d/([a-zA-Z0-9_-]+)", doc_url)
+    m = re.search(r"/document(?:/u/\d+)?/d/([a-zA-Z0-9_-]+)", doc_url)
     if not m:
         return jsonify({"error": "Could not find a Google Doc ID in that URL"}), 400
     doc_id = m.group(1)
