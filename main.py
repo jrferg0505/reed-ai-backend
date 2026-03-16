@@ -536,13 +536,25 @@ def weekly_spend_report():
 
 def daily_spend_report():
     print("Running daily API spend report...")
+    _PRICING = {"haiku-4-5":(0.80,4.0), "sonnet-4-6":(3.0,15.0), "sonnet-4-5":(3.0,15.0), "opus-4-6":(15.0,75.0)}
     try:
-        data = load_json("daily_api_spend.json", {"date": "", "input_tokens": 0, "output_tokens": 0, "calls": 0})
-        cost = (data.get("input_tokens", 0) / 1e6 * 3.0) + (data.get("output_tokens", 0) / 1e6 * 15.0)
-        tokens = data.get("input_tokens", 0) + data.get("output_tokens", 0)
-        cost_str = "< $0.01" if cost < 0.01 else f"${cost:.3f}"
-        msg = f"💰 Daily API Report\nCalls: {data.get('calls',0)}\nTokens: {tokens:,}\nCost: {cost_str}\n"
-        msg += ("⚠️ High Spend." if cost > 0.50 else ("✅ Normal." if cost > 0.10 else "✅ Minimal."))
+        data = load_json("daily_api_spend.json", {"date":"","input_tokens":0,"output_tokens":0,"calls":0,"models":{}})
+        models = data.get("models", {})
+        if models:
+            cost = sum(
+                (v.get("input_tokens",0)/1e6 * _PRICING.get(k,(3.0,15.0))[0]) +
+                (v.get("output_tokens",0)/1e6 * _PRICING.get(k,(3.0,15.0))[1])
+                for k, v in models.items()
+            )
+            breakdown = " | ".join(f"{k}×{v.get('calls',0)}" for k,v in models.items())
+        else:
+            cost = (data.get("input_tokens",0)/1e6*3.0) + (data.get("output_tokens",0)/1e6*15.0)
+            breakdown = ""
+        tokens = data.get("input_tokens",0) + data.get("output_tokens",0)
+        cost_str = "< $0.01" if cost < 0.01 else f"${cost:.4f}"
+        msg = f"API Report — {data.get('calls',0)} calls, {tokens:,} tokens, {cost_str}"
+        if breakdown: msg += f"\n{breakdown}"
+        msg += "\n" + ("⚠️ High." if cost > 0.50 else ("Normal." if cost > 0.10 else "Minimal."))
         send_whatsapp(msg)
     except Exception as e:
         print(f"Daily spend report error: {e}")
@@ -1078,6 +1090,44 @@ def chat():
             })
             result = r2.json()
             if result.get("error"): return jsonify({"error": result["error"]["message"]}), 400
+
+        # ── Cost logging ──────────────────────────────────────────────────────
+        _MODEL_PRICING = {
+            "claude-haiku-4-5-20251001": (0.80, 4.0),
+            "claude-sonnet-4-6":         (3.0,  15.0),
+            "claude-sonnet-4-5":         (3.0,  15.0),
+            "claude-opus-4-6":           (15.0, 75.0),
+        }
+        usage       = result.get("usage", {})
+        in_tok      = usage.get("input_tokens", 0)
+        out_tok     = usage.get("output_tokens", 0)
+        in_p, out_p = _MODEL_PRICING.get(model, (3.0, 15.0))
+        req_cost    = (in_tok / 1e6 * in_p) + (out_tok / 1e6 * out_p)
+        agent_tag   = data.get("_agent", "?")
+        complexity  = data.get("_complexity", "?")
+        model_short = model.replace("claude-", "").replace("-20251001", "")
+        print(f"[CHAT] model={model_short} complexity={complexity} agent={agent_tag} "
+              f"in={in_tok} out={out_tok} cost=${req_cost:.5f}")
+
+        # Update daily spend (per-model breakdown)
+        try:
+            spend = load_json("daily_api_spend.json", {"date": "", "input_tokens": 0, "output_tokens": 0, "calls": 0, "models": {}})
+            today = datetime.now().strftime("%Y-%m-%d")
+            if spend.get("date") != today:
+                spend = {"date": today, "input_tokens": 0, "output_tokens": 0, "calls": 0, "models": {}}
+            spend["input_tokens"]  += in_tok
+            spend["output_tokens"] += out_tok
+            spend["calls"]         += 1
+            mdl = spend.setdefault("models", {})
+            if model_short not in mdl:
+                mdl[model_short] = {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+            mdl[model_short]["calls"]         += 1
+            mdl[model_short]["input_tokens"]  += in_tok
+            mdl[model_short]["output_tokens"] += out_tok
+            save_json("daily_api_spend.json", spend)
+        except Exception as log_err:
+            print(f"[CHAT] spend log error: {log_err}")
+
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1095,8 +1145,18 @@ def agent_status():
 
 @app.route("/agent/spend")
 def agent_spend():
-    data = load_json("daily_api_spend.json", {"date":"","input_tokens":0,"output_tokens":0,"calls":0})
-    cost = (data.get("input_tokens",0)/1e6*3.0) + (data.get("output_tokens",0)/1e6*15.0)
+    _PRICING = {"haiku-4-5":(0.80,4.0), "sonnet-4-6":(3.0,15.0), "sonnet-4-5":(3.0,15.0), "opus-4-6":(15.0,75.0)}
+    data = load_json("daily_api_spend.json", {"date":"","input_tokens":0,"output_tokens":0,"calls":0,"models":{}})
+    # Compute cost from per-model breakdown if available, else fall back to Sonnet rates
+    models = data.get("models", {})
+    if models:
+        cost = sum(
+            (v.get("input_tokens",0)/1e6 * _PRICING.get(k,(3.0,15.0))[0]) +
+            (v.get("output_tokens",0)/1e6 * _PRICING.get(k,(3.0,15.0))[1])
+            for k, v in models.items()
+        )
+    else:
+        cost = (data.get("input_tokens",0)/1e6*3.0) + (data.get("output_tokens",0)/1e6*15.0)
     return jsonify({**data, "estimated_cost_usd": round(cost, 4)})
 
 @app.route("/agent/scan-jobs", methods=["POST","GET"])
