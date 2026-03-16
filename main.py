@@ -1890,6 +1890,135 @@ def govee_control():
         ok, detail = govee_control_all(cmd_name, cmd_value)
         return jsonify({"ok": ok, "detail": detail})
 
+# ── Memory Routes ──────────────────────────────────────────────────────────
+# Persistent memory stored in os.environ["ONYX_MEMORY"] (same pattern as GCAL_TOKEN).
+# Seed value in Render dashboard: set ONYX_MEMORY = {"memories":[]} to initialize.
+# Every write updates os.environ in-process AND writes onyx_memory.json as local fallback.
+
+_MEMORY_FILE = "onyx_memory.json"
+
+def _load_memory():
+    val = os.environ.get("ONYX_MEMORY", "")
+    if val:
+        try:
+            return json.loads(val)
+        except Exception:
+            pass
+    if os.path.exists(_MEMORY_FILE):
+        try:
+            with open(_MEMORY_FILE) as f:
+                data = json.loads(f.read())
+            os.environ["ONYX_MEMORY"] = json.dumps(data)
+            return data
+        except Exception:
+            pass
+    return {"memories": []}
+
+def _save_memory(data):
+    s = json.dumps(data)
+    os.environ["ONYX_MEMORY"] = s
+    try:
+        with open(_MEMORY_FILE, "w") as f:
+            f.write(s)
+    except Exception:
+        pass
+
+@app.route("/memory", methods=["GET"])
+def memory_get():
+    return jsonify(_load_memory())
+
+@app.route("/memory", methods=["POST"])
+def memory_add():
+    data = request.get_json() or {}
+    content = data.get("content", "").strip()
+    category = data.get("category", "general")
+    if not content:
+        return jsonify({"error": "content required"}), 400
+    mem = _load_memory()
+    today = datetime.now().strftime("%b %d")
+    new_mem = {
+        "id": str(int(datetime.now().timestamp() * 1000)),
+        "content": content,
+        "category": category,
+        "date": today,
+    }
+    mem["memories"].insert(0, new_mem)
+    _save_memory(mem)
+    return jsonify({"ok": True, "memory": new_mem})
+
+@app.route("/memory/<mem_id>", methods=["DELETE"])
+def memory_delete(mem_id):
+    mem = _load_memory()
+    mem["memories"] = [m for m in mem["memories"] if m.get("id") != mem_id]
+    _save_memory(mem)
+    return jsonify({"ok": True})
+
+@app.route("/memory/extract", methods=["POST"])
+def memory_extract():
+    """Use Claude haiku to extract worth-remembering facts from a user message."""
+    data = request.get_json() or {}
+    message = data.get("message", "").strip()
+    if not message or len(message) < 8:
+        return jsonify({"extracted": []})
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 256,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        "Does this message from Reed contain any facts worth remembering long-term? "
+                        "Examples: preferences, goals, personal info, habits, important life facts.\n"
+                        "If yes, return ONLY a JSON array: "
+                        '[{"content":"fact","category":"preference|goal|work|general"}]\n'
+                        "If nothing worth remembering, return: []\n\n"
+                        f'Message: "{message}"\n\nReturn ONLY the JSON array, nothing else.'
+                    ),
+                }],
+            },
+            timeout=20,
+        )
+        text = ""
+        if resp.ok:
+            rb = resp.json()
+            text = rb.get("content", [{}])[0].get("text", "[]")
+        match = re.search(r'\[[\s\S]*\]', text)
+        if not match:
+            return jsonify({"extracted": []})
+        extracted = json.loads(match.group(0))
+        if not extracted:
+            return jsonify({"extracted": []})
+        # Persist extracted memories, deduplicating against existing
+        mem = _load_memory()
+        today = datetime.now().strftime("%b %d")
+        saved = []
+        existing_lower = {m["content"].lower() for m in mem["memories"]}
+        for e in extracted:
+            c = e.get("content", "").strip()
+            if not c or c.lower() in existing_lower:
+                continue
+            new_mem = {
+                "id": str(int(datetime.now().timestamp() * 1000)),
+                "content": c,
+                "category": e.get("category", "general"),
+                "date": today,
+            }
+            mem["memories"].insert(0, new_mem)
+            existing_lower.add(c.lower())
+            saved.append(new_mem)
+        if saved:
+            _save_memory(mem)
+        return jsonify({"extracted": saved})
+    except Exception as e:
+        return jsonify({"extracted": [], "error": str(e)})
+
 # ── Voice Routes ──
 
 @app.route("/voice/transcribe", methods=["POST"])
