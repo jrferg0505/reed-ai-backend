@@ -795,6 +795,23 @@ def add_shift_to_calendar(svc, shift):
         print(f"[SCHEDULE] add_event error: {e}")
         return False
 
+def fmt_time(t):
+    """Convert 24h 'HH:MM' to 12h 'H:MM AM/PM'. Returns t unchanged if it can't be parsed."""
+    try:
+        return datetime.strptime(t, "%H:%M").strftime("%-I:%M %p")
+    except Exception:
+        return t
+
+def paycheck_breakdown(gross):
+    """Return dict with gross, deductions, and net for Indiana."""
+    federal = round(gross * 0.12, 2)
+    state   = round(gross * 0.0305, 2)
+    fica    = round(gross * 0.0765, 2)
+    total_deductions = round(federal + state + fica, 2)
+    net = round(gross - total_deductions, 2)
+    return {"gross": gross, "federal": federal, "state": state, "fica": fica,
+            "total_deductions": total_deductions, "net": net}
+
 def get_shifts_text():
     """Return upcoming shifts as plain text for WhatsApp/chat."""
     shifts = load_json("shifts.json", [])
@@ -807,9 +824,10 @@ def get_shifts_text():
     for s in upcoming[:7]:
         hrs = s.get("hours", 0)
         total_hrs += float(hrs)
-        lines.append(f"  • {s.get('day','')} {s['date']}  {s['start']}–{s['end']}  ({hrs}h)")
+        lines.append(f"  • {s.get('day','')} {s['date']}  {fmt_time(s['start'])}–{fmt_time(s['end'])}  ({hrs}h)")
     if HOURLY_RATE > 0:
-        lines.append(f"\n💵 Projected paycheck: ${total_hrs * HOURLY_RATE:,.2f}")
+        b = paycheck_breakdown(round(total_hrs * HOURLY_RATE, 2))
+        lines.append(f"\n💵 Gross: ${b['gross']:,.2f}  |  Taxes: -${b['total_deductions']:,.2f}  |  Take-home: ~${b['net']:,.2f}")
     return "\n".join(lines)
 
 def get_next_shift_text():
@@ -821,9 +839,10 @@ def get_next_shift_text():
         return "No upcoming shifts found."
     s = upcoming[0]
     hrs = s.get("hours", 0)
-    msg = f"Your next shift is {s.get('day','')} {s['date']} from {s['start']} to {s['end']} ({hrs}h)"
+    msg = f"Your next shift is {s.get('day','')} {s['date']} from {fmt_time(s['start'])} to {fmt_time(s['end'])} ({hrs}h)"
     if HOURLY_RATE > 0:
-        msg += f"  — that's ${float(hrs)*HOURLY_RATE:,.2f} for that shift."
+        b = paycheck_breakdown(round(float(hrs) * HOURLY_RATE, 2))
+        msg += f"  — Gross ${b['gross']:,.2f}, take-home ~${b['net']:,.2f} after taxes."
     return msg
 
 def shift_reminder_check():
@@ -845,7 +864,7 @@ def shift_reminder_check():
             delta_min = (start_dt - now).total_seconds() / 60
             if 55 <= delta_min <= 65:
                 msg = (f"⏰ Shift reminder: You work in 1 hour!\n"
-                       f"📍 {s.get('day','')} {s['start']}–{s['end']} ({s.get('hours','')}h)")
+                       f"📍 {s.get('day','')} {fmt_time(s['start'])}–{fmt_time(s['end'])} ({s.get('hours','')}h)")
                 send_whatsapp(msg)
                 reminded.append(key)
                 save_json("shifts_reminded.json", reminded)
@@ -1139,7 +1158,13 @@ def wa_webhook():
                         today_str = datetime.now().strftime("%Y-%m-%d")
                         total_hrs = sum(float(s.get("hours",0)) for s in shifts if s.get("date","") >= today_str)
                         if HOURLY_RATE > 0 and total_hrs > 0:
-                            reply_text = f"💵 Projected paycheck: ${total_hrs * HOURLY_RATE:,.2f} ({total_hrs}h × ${HOURLY_RATE}/hr)"
+                            b = paycheck_breakdown(round(total_hrs * HOURLY_RATE, 2))
+                            reply_text = (f"💵 Paycheck ({total_hrs}h × ${HOURLY_RATE}/hr)\n"
+                                          f"Gross: ${b['gross']:,.2f}\n"
+                                          f"Federal (12%): -${b['federal']:,.2f}\n"
+                                          f"Indiana (3.05%): -${b['state']:,.2f}\n"
+                                          f"FICA (7.65%): -${b['fica']:,.2f}\n"
+                                          f"Take-home: ~${b['net']:,.2f}")
                         else:
                             reply_text = "No shifts or hourly rate configured yet."
                     elif is_next:
@@ -1810,17 +1835,19 @@ def schedule_sync():
 
     today = datetime.now().strftime("%Y-%m-%d")
     total_hrs = sum(float(s.get("hours", 0)) for s in shifts if s.get("date", "") >= today)
-    paycheck = round(total_hrs * HOURLY_RATE, 2) if HOURLY_RATE > 0 else None
-    print(f"[SCHEDULE SYNC] done — {len(shifts)} shifts, {added} cal events, {total_hrs}h, ${paycheck} ({elapsed()})")
-    return jsonify({"shifts": shifts, "calendar_events_added": added, "total_hours": total_hrs, "projected_paycheck": paycheck})
+    gross = round(total_hrs * HOURLY_RATE, 2) if HOURLY_RATE > 0 else None
+    pay = paycheck_breakdown(gross) if gross is not None else None
+    print(f"[SCHEDULE SYNC] done — {len(shifts)} shifts, {added} cal events, {total_hrs}h, ${gross} ({elapsed()})")
+    return jsonify({"shifts": shifts, "calendar_events_added": added, "total_hours": total_hrs, "paycheck": pay})
 
 @app.route("/schedule/shifts")
 def schedule_shifts():
     shifts = load_json("shifts.json", [])
     today  = datetime.now().strftime("%Y-%m-%d")
     total_hrs = sum(float(s.get("hours", 0)) for s in shifts if s.get("date","") >= today)
-    paycheck  = round(total_hrs * HOURLY_RATE, 2) if HOURLY_RATE > 0 else None
-    return jsonify({"shifts": shifts, "total_hours": total_hrs, "projected_paycheck": paycheck, "hourly_rate": HOURLY_RATE})
+    gross = round(total_hrs * HOURLY_RATE, 2) if HOURLY_RATE > 0 else None
+    pay = paycheck_breakdown(gross) if gross is not None else None
+    return jsonify({"shifts": shifts, "total_hours": total_hrs, "paycheck": pay, "hourly_rate": HOURLY_RATE})
 
 @app.route("/schedule/shifts/clear", methods=["POST"])
 def schedule_shifts_clear():
