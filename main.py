@@ -522,7 +522,6 @@ scheduler.add_job(daily_spend_ask,     CronTrigger(hour=22, minute=0, timezone=T
 scheduler.add_job(weekly_spend_report, CronTrigger(day_of_week="tue", hour=16, minute=0, timezone=TIMEZONE),id="weekly_spend_report", replace_existing=True)
 scheduler.add_job(daily_spend_report,  CronTrigger(hour=21, minute=0, timezone=TIMEZONE),                   id="daily_spend_report",  replace_existing=True)
 scheduler.add_job(keep_alive,            "interval", minutes=5,                                               id="keep_alive",            replace_existing=True)
-scheduler.add_job(shift_reminder_check,  "interval", minutes=5,                                               id="shift_reminder",        replace_existing=True)
 scheduler.start()
 print(f"Scheduler started ({TIMEZONE}). On-demand briefing active.")
 
@@ -853,6 +852,8 @@ def shift_reminder_check():
     except Exception as e:
         print(f"[SCHEDULE] reminder error: {e}")
 
+scheduler.add_job(shift_reminder_check, "interval", minutes=5, id="shift_reminder", replace_existing=True)
+
 @app.route("/")
 def index(): return jsonify({"status": "Reed AI Backend Running", "time": datetime.now().isoformat()})
 
@@ -895,8 +896,6 @@ def chat():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/ping")
-def ping(): return jsonify({"ok": True})
 
 @app.route("/test-sms")
 def test_sms():
