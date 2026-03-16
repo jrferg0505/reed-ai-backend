@@ -37,6 +37,8 @@ GMAIL_SCOPES = [
 TIMEZONE      = os.environ.get("TIMEZONE", "America/New_York")
 ONYX_API_KEY  = os.environ.get("ONYX_API_KEY", "")
 HOURLY_RATE   = float(os.environ.get("HOURLY_RATE", "0"))
+GOVEE_API_KEY = os.environ.get("GOVEE_API_KEY", "")
+GOVEE_BASE    = "https://developer-api.govee.com/v1/devices"
 
 # Routes exempt from API key check (Twilio + Google OAuth callbacks must be public)
 _PUBLIC_ROUTES = {"/wa-webhook", "/gcal/callback", "/gmail/callback", "/health", "/ping"}
@@ -569,6 +571,96 @@ def _clear_token(env_key, file_path):
             os.remove(file_path)
         except Exception:
             pass
+
+# ── Govee helpers ──
+_GOVEE_COLORS = {
+    "red": (255,0,0), "green": (0,255,0), "blue": (0,0,255),
+    "white": (255,255,255), "warm white": (255,200,100), "yellow": (255,220,0),
+    "orange": (255,100,0), "purple": (128,0,255), "pink": (255,20,147),
+    "cyan": (0,255,255), "teal": (0,128,128), "lime": (0,255,0),
+    "magenta": (255,0,255), "off": None,
+}
+
+def _govee_headers():
+    return {"Govee-API-Key": GOVEE_API_KEY, "Content-Type": "application/json"}
+
+def govee_get_devices():
+    """Return list of Govee devices or empty list on error."""
+    if not GOVEE_API_KEY:
+        return []
+    try:
+        r = requests.get(GOVEE_BASE, headers=_govee_headers(), timeout=10)
+        return r.json().get("data", {}).get("devices", [])
+    except Exception as e:
+        print(f"[GOVEE] get_devices error: {e}")
+        return []
+
+def govee_control_all(cmd_name, cmd_value):
+    """Send a control command to ALL controllable Govee devices."""
+    devices = govee_get_devices()
+    if not devices:
+        return False, "No Govee devices found or API key not set."
+    ok = 0
+    for dev in devices:
+        if not dev.get("controllable", True):
+            continue
+        try:
+            payload = {"device": dev["device"], "model": dev["model"],
+                       "cmd": {"name": cmd_name, "value": cmd_value}}
+            r = requests.put(f"{GOVEE_BASE}/control", headers=_govee_headers(),
+                             json=payload, timeout=10)
+            if r.status_code == 200:
+                ok += 1
+        except Exception as e:
+            print(f"[GOVEE] control error on {dev.get('device')}: {e}")
+    return ok > 0, f"Sent to {ok}/{len(devices)} devices."
+
+def parse_govee_command(text):
+    """Parse a light command string. Returns list of (cmd_name, cmd_value) tuples."""
+    t = text.lower()
+    cmds = []
+    # on/off
+    if re.search(r'\b(turn\s+)?(lights?\s+)?(on)\b', t) and "off" not in t:
+        cmds.append(("turn", "on"))
+    elif re.search(r'\b(turn\s+)?(lights?\s+)?off\b', t):
+        cmds.append(("turn", "off"))
+    # color
+    for name, rgb in _GOVEE_COLORS.items():
+        if name in t and rgb is not None:
+            cmds.append(("color", {"r": rgb[0], "g": rgb[1], "b": rgb[2]}))
+            break
+    # hex color #RRGGBB
+    hex_m = re.search(r'#([0-9a-fA-F]{6})', text)
+    if hex_m:
+        h = hex_m.group(1)
+        cmds.append(("color", {"r": int(h[0:2],16), "g": int(h[2:4],16), "b": int(h[4:6],16)}))
+    # brightness
+    bri_m = re.search(r'(\d+)\s*%?\s*(brightness|bright|dim)', t) or \
+            re.search(r'brightness\s+(?:to\s+)?(\d+)', t) or \
+            re.search(r'set\s+(?:it\s+)?to\s+(\d+)%', t)
+    if bri_m:
+        val = int(bri_m.group(1))
+        cmds.append(("brightness", max(1, min(100, val))))
+    return cmds
+
+def govee_wa_reply(text):
+    """Execute parsed Govee command and return a WhatsApp reply string."""
+    cmds = parse_govee_command(text)
+    if not cmds:
+        return None
+    if not GOVEE_API_KEY:
+        return "💡 Govee API key not set — add GOVEE_API_KEY in Render settings."
+    msgs = []
+    for name, value in cmds:
+        ok, detail = govee_control_all(name, value)
+        if name == "turn":
+            msgs.append(f"💡 Lights {'on' if value=='on' else 'off'}. {detail}")
+        elif name == "color":
+            color_str = next((k for k,v in _GOVEE_COLORS.items() if v and tuple(value.values())==v), str(value))
+            msgs.append(f"🎨 Color set to {color_str}. {detail}")
+        elif name == "brightness":
+            msgs.append(f"🔆 Brightness set to {value}%. {detail}")
+    return "\n".join(msgs) if msgs else None
 
 # ── Plaid helpers ──
 def _plaid_post(path, payload):
@@ -1172,6 +1264,20 @@ def wa_webhook():
                     else:
                         reply_text = get_shifts_text()
 
+            # ── Path B.8: light control ──────────────────────────────────────
+            if reply_text is None:
+                _LIGHT_RE = re.compile(
+                    r'\b(turn\s+(my\s+)?lights?\s+(on|off)|'
+                    r'lights?\s+(on|off)|'
+                    r'set\s+(my\s+)?lights?\s+to\s+\w+|'
+                    r'(set\s+)?(brightness|bright|dim)\s+(to\s+)?\d+|'
+                    r'light\s+(color|colour)|'
+                    r'make\s+(my\s+)?lights?\s+\w+)\b',
+                    re.IGNORECASE,
+                )
+                if _LIGHT_RE.search(body):
+                    reply_text = govee_wa_reply(body)
+
             # ── Path C: regular AI conversation ──────────────────────────────
             if reply_text is None:
                 context = []
@@ -1746,6 +1852,42 @@ def plaid_disconnect():
     except Exception:
         pass
     return jsonify({"disconnected": True})
+
+# ── Govee Routes ──
+
+@app.route("/govee/devices")
+def govee_devices():
+    if not GOVEE_API_KEY:
+        return jsonify({"error": "GOVEE_API_KEY not configured"}), 503
+    devices = govee_get_devices()
+    return jsonify({"devices": devices})
+
+@app.route("/govee/control", methods=["POST"])
+def govee_control():
+    if not GOVEE_API_KEY:
+        return jsonify({"error": "GOVEE_API_KEY not configured"}), 503
+    data = request.get_json() or {}
+    cmd_name  = data.get("cmd")    # "turn" | "color" | "brightness"
+    cmd_value = data.get("value")  # "on"/"off" | {r,g,b} | 0-100
+    device    = data.get("device") # specific device address, or None = all
+    model     = data.get("model")  # required if device is specified
+
+    if not cmd_name or cmd_value is None:
+        return jsonify({"error": "cmd and value required"}), 400
+
+    if device and model:
+        # Single device
+        try:
+            payload = {"device": device, "model": model,
+                       "cmd": {"name": cmd_name, "value": cmd_value}}
+            r = requests.put(f"{GOVEE_BASE}/control", headers=_govee_headers(),
+                             json=payload, timeout=10)
+            return jsonify(r.json()), r.status_code
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    else:
+        ok, detail = govee_control_all(cmd_name, cmd_value)
+        return jsonify({"ok": ok, "detail": detail})
 
 # ── Schedule Routes ──
 
