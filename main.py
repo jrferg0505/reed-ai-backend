@@ -2000,12 +2000,13 @@ def memory_extract():
         today = datetime.now().strftime("%b %d")
         saved = []
         existing_lower = {m["content"].lower() for m in mem["memories"]}
-        for e in extracted:
+        base_ts = int(datetime.now().timestamp() * 1000)
+        for idx, e in enumerate(extracted):
             c = e.get("content", "").strip()
             if not c or c.lower() in existing_lower:
                 continue
             new_mem = {
-                "id": str(int(datetime.now().timestamp() * 1000)),
+                "id": str(base_ts + idx),  # unique per item even in same millisecond
                 "content": c,
                 "category": e.get("category", "general"),
                 "date": today,
