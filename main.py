@@ -1,4 +1,4 @@
-import os, json, re, requests, threading, base64
+import os, json, re, requests, threading, base64, secrets
 from email.mime.text import MIMEText
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -2410,6 +2410,122 @@ def schedule_shifts_clear():
     save_json("shifts.json", [])
     save_json("shifts_reminded.json", [])
     return jsonify({"cleared": True})
+
+# ── AUTH ──────────────────────────────────────────────────────────────────────
+try:
+    from werkzeug.security import check_password_hash, generate_password_hash
+except ImportError:
+    def generate_password_hash(pw): return pw
+    def check_password_hash(stored, pw): return stored == pw
+
+def _load_sessions():
+    raw = os.environ.get("ONYX_SESSIONS", "")
+    if not raw:
+        try:
+            with open("onyx_sessions.json") as f: return json.load(f)
+        except: return {}
+    try: return json.loads(raw)
+    except: return {}
+
+def _save_sessions(s):
+    data = json.dumps(s)
+    os.environ["ONYX_SESSIONS"] = data
+    try:
+        with open("onyx_sessions.json", "w") as f: f.write(data)
+    except: pass
+
+def _verify_session(token):
+    if not token: return False
+    sessions = _load_sessions()
+    if token not in sessions: return False
+    last = sessions[token].get("last_used", "2000-01-01")
+    if (datetime.now() - datetime.fromisoformat(last)).days >= 7: return False
+    sessions[token]["last_used"] = datetime.now().isoformat()
+    _save_sessions(sessions)
+    return True
+
+@app.route("/auth/status", methods=["GET"])
+def auth_status():
+    stored = os.environ.get("ONYX_PASSWORD", "").strip()
+    if not stored:
+        try:
+            with open("onyx_password.txt") as f: stored = f.read().strip()
+            if stored: os.environ["ONYX_PASSWORD"] = stored
+        except: pass
+    return jsonify({"setup": bool(stored)})
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    data = request.json or {}
+    pw = data.get("password", "")
+    if not pw: return jsonify({"error": "Password required"}), 400
+    stored = os.environ.get("ONYX_PASSWORD", "").strip()
+    if not stored:
+        try:
+            with open("onyx_password.txt") as f: stored = f.read().strip()
+            if stored: os.environ["ONYX_PASSWORD"] = stored
+        except: pass
+    if not stored:
+        hashed = generate_password_hash(pw)
+        os.environ["ONYX_PASSWORD"] = hashed
+        try:
+            with open("onyx_password.txt", "w") as f: f.write(hashed)
+        except: pass
+        print("[AUTH] Password set for first time.")
+    elif not check_password_hash(stored, pw):
+        return jsonify({"error": "Incorrect password"}), 401
+    token = secrets.token_urlsafe(32)
+    now = datetime.now()
+    sessions = _load_sessions()
+    sessions = {t: v for t, v in sessions.items()
+                if (now - datetime.fromisoformat(v.get("last_used","2000-01-01"))).days < 7}
+    sessions[token] = {"created": now.isoformat(), "last_used": now.isoformat()}
+    _save_sessions(sessions)
+    print(f"[AUTH] Login OK. Active sessions: {len(sessions)}")
+    return jsonify({"token": token})
+
+@app.route("/auth/verify", methods=["GET"])
+def auth_verify():
+    return jsonify({"valid": _verify_session(request.headers.get("X-Session-Token",""))})
+
+@app.route("/auth/logout", methods=["POST"])
+def auth_logout():
+    token = request.headers.get("X-Session-Token", "")
+    sessions = _load_sessions()
+    sessions.pop(token, None)
+    _save_sessions(sessions)
+    return jsonify({"ok": True})
+
+# ── CHAT HISTORY ───────────────────────────────────────────────────────────────
+def _load_chat_history():
+    raw = os.environ.get("ONYX_CHAT_HISTORY", "")
+    if not raw:
+        try:
+            with open("onyx_chat_history.json") as f: return json.load(f)
+        except: return []
+    try: return json.loads(raw)
+    except: return []
+
+def _save_chat_history(convs):
+    data = json.dumps(convs)
+    os.environ["ONYX_CHAT_HISTORY"] = data
+    try:
+        with open("onyx_chat_history.json", "w") as f: f.write(data)
+    except: pass
+
+@app.route("/chat/history", methods=["GET"])
+def get_chat_history():
+    if not _verify_session(request.headers.get("X-Session-Token","")): return jsonify({"error":"Unauthorized"}),401
+    return jsonify({"conversations": _load_chat_history()})
+
+@app.route("/chat/history", methods=["POST"])
+def post_chat_history():
+    if not _verify_session(request.headers.get("X-Session-Token","")): return jsonify({"error":"Unauthorized"}),401
+    convs = (request.json or {}).get("conversations", [])[-50:]
+    for c in convs:
+        if "messages" in c and len(c["messages"]) > 50: c["messages"] = c["messages"][-50:]
+    _save_chat_history(convs)
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
