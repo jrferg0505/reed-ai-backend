@@ -2444,36 +2444,36 @@ def _verify_session(token):
     _save_sessions(sessions)
     return True
 
-@app.route("/auth/status", methods=["GET"])
-def auth_status():
-    stored = os.environ.get("ONYX_PASSWORD", "").strip()
+def _get_stored_pin():
+    stored = os.environ.get("ONYX_PIN", "").strip()
     if not stored:
         try:
-            with open("onyx_password.txt") as f: stored = f.read().strip()
-            if stored: os.environ["ONYX_PASSWORD"] = stored
+            with open("onyx_pin.txt") as f: stored = f.read().strip()
+            if stored: os.environ["ONYX_PIN"] = stored
         except: pass
-    return jsonify({"setup": bool(stored)})
+    return stored
+
+@app.route("/auth/status", methods=["GET"])
+def auth_status():
+    return jsonify({"setup": bool(_get_stored_pin())})
 
 @app.route("/auth/login", methods=["POST"])
 def auth_login():
     data = request.json or {}
-    pw = data.get("password", "")
-    if not pw: return jsonify({"error": "Password required"}), 400
-    stored = os.environ.get("ONYX_PASSWORD", "").strip()
+    pin = data.get("pin", "")
+    if not pin or not re.match(r'^\d{4}$', pin):
+        return jsonify({"error": "4-digit PIN required"}), 400
+    stored = _get_stored_pin()
     if not stored:
+        # First use — set the PIN
+        hashed = generate_password_hash(pin)
+        os.environ["ONYX_PIN"] = hashed
         try:
-            with open("onyx_password.txt") as f: stored = f.read().strip()
-            if stored: os.environ["ONYX_PASSWORD"] = stored
+            with open("onyx_pin.txt", "w") as f: f.write(hashed)
         except: pass
-    if not stored:
-        hashed = generate_password_hash(pw)
-        os.environ["ONYX_PASSWORD"] = hashed
-        try:
-            with open("onyx_password.txt", "w") as f: f.write(hashed)
-        except: pass
-        print("[AUTH] Password set for first time.")
-    elif not check_password_hash(stored, pw):
-        return jsonify({"error": "Incorrect password"}), 401
+        print("[AUTH] PIN set for first time.")
+    elif not check_password_hash(stored, pin):
+        return jsonify({"error": "Wrong PIN"}), 401
     token = secrets.token_urlsafe(32)
     now = datetime.now()
     sessions = _load_sessions()
@@ -2481,7 +2481,7 @@ def auth_login():
                 if (now - datetime.fromisoformat(v.get("last_used","2000-01-01"))).days < 7}
     sessions[token] = {"created": now.isoformat(), "last_used": now.isoformat()}
     _save_sessions(sessions)
-    print(f"[AUTH] Login OK. Active sessions: {len(sessions)}")
+    print(f"[AUTH] PIN login OK. Active sessions: {len(sessions)}")
     return jsonify({"token": token})
 
 @app.route("/auth/verify", methods=["GET"])
